@@ -368,23 +368,25 @@ class LMK04828:
     # ==================================================================
     # Configuration files
     # ==================================================================
-
     @staticmethod
     def parse_config(filename):
         """
-        Parse a TICS Pro-style LMK register configuration.
+        Parse an LMK configuration file.
 
-        Example:
+        Supported formats:
 
+        1. TICS Pro:
             R0 (INIT)   0x000090
-            R0          0x000010
-            R2          0x000200
-            R3          0x000306
-
-        TICS format:
+            R0           0x000010
+            R2           0x000200
 
             bits 23:8 = register address
             bits  7:0 = register value
+
+        2. EVM GUI:
+            0x146 0x10
+            0x147 0x1A
+            0x155 0x00
 
         Returns
         -------
@@ -394,9 +396,18 @@ class LMK04828:
 
         registers = []
 
-        pattern = re.compile(
+        # TICS Pro format:
+        # R123 [optional text] 0x123456
+        tics_pattern = re.compile(
             r"^\s*R(\d+)"
             r"(?:\s*\([^)]*\))?"
+            r"\s+(0x[0-9A-Fa-f]+)"
+        )
+
+        # EVM GUI format:
+        # 0x123 0x45
+        evm_pattern = re.compile(
+            r"^\s*(0x[0-9A-Fa-f]+)"
             r"\s+(0x[0-9A-Fa-f]+)"
         )
 
@@ -404,26 +415,59 @@ class LMK04828:
 
             for line_number, line in enumerate(file, start=1):
 
-                match = pattern.match(line)
+                # ---------------------------------------------------------
+                # TICS Pro format
+                # ---------------------------------------------------------
+                match = tics_pattern.match(line)
 
-                if match is None:
+                if match is not None:
+
+                    address_from_name = int(match.group(1))
+                    word = int(match.group(2), 16)
+
+                    address = (word >> 8) & 0x1FFF
+                    value = word & 0xFF
+
+                    if address != address_from_name:
+                        raise ValueError(
+                            f"{filename}:{line_number}: "
+                            f"register name R{address_from_name} "
+                            f"does not match address "
+                            f"0x{address:03X}"
+                        )
+
+                    registers.append((address, value))
                     continue
 
-                address_from_name = int(match.group(1))
-                word = int(match.group(2), 16)
+                # ---------------------------------------------------------
+                # EVM GUI format
+                # ---------------------------------------------------------
+                match = evm_pattern.match(line)
 
-                address = (word >> 8) & 0x1FFF
-                value = word & 0xFF
+                if match is not None:
 
-                if address != address_from_name:
-                    raise ValueError(
-                        f"{filename}:{line_number}: "
-                        f"register name R{address_from_name} "
-                        f"does not match address "
-                        f"0x{address:03X}"
-                    )
+                    address = int(match.group(1), 16)
+                    value = int(match.group(2), 16)
 
-                registers.append((address, value))
+                    if address > 0x1FFF:
+                        raise ValueError(
+                            f"{filename}:{line_number}: "
+                            f"register address 0x{address:X} "
+                            f"exceeds LMK address range"
+                        )
+
+                    if value > 0xFF:
+                        raise ValueError(
+                            f"{filename}:{line_number}: "
+                            f"register value 0x{value:X} "
+                            f"is larger than one byte"
+                        )
+
+                    registers.append((address, value))
+                    continue
+
+                # Everything else is ignored:
+                # blank lines, LMK04828 headers, comments, etc.
 
         if not registers:
             raise ValueError(
