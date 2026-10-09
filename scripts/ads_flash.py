@@ -2,8 +2,7 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from ads54j40 import ADS54J40
+from ti_adcevm.ads54j40 import ADS54J40
 
 # ---------------- target config (adjust as needed) ----------------
 SAMPLE_MSPS = 800          # ADC sampling rate
