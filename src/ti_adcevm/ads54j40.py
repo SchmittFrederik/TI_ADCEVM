@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 
-import time
-
-from pyftdi.gpio import GpioAsyncController
+from ti_adcevm.ftdi_gpio import ADSGpioSyncController
 
 
 class ADS54J40:
@@ -77,8 +75,8 @@ class ADS54J40:
 
 
     The class intentionally keeps the low-level SPI interface generic.
-    The ADS54J40-specific M/P/page-selection logic is handled here,
-    so application code does not need to know about it.
+    ADS54J40-specific M/P/page-selection logic is handled here, so
+    application code does not need to know about it.
     """
 
     # ==================================================================
@@ -92,29 +90,17 @@ class ADS54J40:
 
     OUTPUT_PINS = SCK | SDIO | SEN
 
-    # 100 us half-period -> approximately 5 kHz SCLK.
+    # SPI clock half-period in seconds.
+    #
+    # 5 ms half-period -> approximately 100 Hz SCLK.
     #
     # Deliberately slow during initial bring-up and well below the
     # ADS54J40 SPI maximum of 2 MHz.
-    HALF_PERIOD = 100e-6
-
+    HALF_PERIOD = 500e-9
     # ==================================================================
     # ADS54J40 register/page structure
     # ==================================================================
 
-    # Every entry describes a user-visible register page.
-    #
-    # "bank"       -> M bit
-    # "page_access"-> P bit
-    #
-    # "selector" describes how this page is selected:
-    #
-    #   ("analog", value)
-    #   ("jesd", value)
-    #   ("offset", value)
-    #
-    # Pages with selector=None are directly accessible registers.
-    #
     PAGES = {
 
         # --------------------------------------------------------------
@@ -211,15 +197,6 @@ class ADS54J40:
 
         # --------------------------------------------------------------
         # Offset pages
-        #
-        # First:
-        #
-        #     JESD Bank Page Selection = 0x6100
-        #
-        # Then:
-        #
-        #     0x0000 -> Offset Read
-        #     0x0500 -> Offset Load
         # --------------------------------------------------------------
 
         "offset_page_select": {
@@ -259,19 +236,7 @@ class ADS54J40:
         verbose=True,
     ):
         """
-        Initialize the FT245 GPIO interface.
-
-        Parameters
-        ----------
-        url : str
-            PyFtdi FT245 URL.
-
-        half_period : float or None
-            SPI half-period in seconds.
-            Defaults to HALF_PERIOD.
-
-        verbose : bool
-            Print SPI transactions if True.
+        Initialize the FT232R synchronous GPIO interface.
         """
 
         self.url = url
@@ -282,29 +247,49 @@ class ADS54J40:
         else:
             self.half_period = half_period
 
-        self.gpio = GpioAsyncController()
+        if self.half_period <= 0:
+            raise ValueError("half_period must be positive")
 
+        # GpioSyncController outputs one GPIO sample per configured
+        # frequency period. Two samples are used for each SPI clock
+        # cycle: one with SCK low and one with SCK high.
+        self.gpio_frequency = 1.0 / self.half_period
+
+        self.gpio = ADSGpioSyncController()
         self.gpio.configure(
-            url,
+            self.url,
             direction=self.OUTPUT_PINS,
-            frequency=100_000,
+            frequency=self.gpio_frequency,
+            initial=self.SEN,
         )
-
-        # Idle state:
-        #
-        # SEN = 1
-        # SCK = 0
-        # SDIO = 0
-        #
-        self._write_gpio(self.SEN)
-
     # ==================================================================
     # GPIO
     # ==================================================================
+    def _exchange(self, outputs):
+        """Output a GPIO waveform and return the sampled GPIO inputs."""
+
+        if not outputs:
+            return b""
+
+        outputs = bytes(outputs)
+        inputs = self.gpio.exchange(outputs)
+
+        if len(inputs) != len(outputs):
+            raise RuntimeError(
+                f"FTDI exchange length mismatch: "
+                f"sent {len(outputs)} bytes, received {len(inputs)} bytes"
+            )
+
+        return inputs
 
     def _write_gpio(self, value):
-        """Write the complete FT245 GPIO output value."""
-        self.gpio.write(value)
+        """
+        Write one GPIO state.
+
+        Kept for compatibility with the existing driver.
+        """
+
+        self._exchange(bytes([value]))
 
     # ==================================================================
     # SPI clocking
@@ -319,16 +304,12 @@ class ADS54J40:
 
         value = self.SDIO if bit else 0
 
-        # Put data on SDIO.
-        self._write_gpio(value)
-        time.sleep(self.half_period)
-
-        # Rising edge.
-        self._write_gpio(value | self.SCK)
-        time.sleep(self.half_period)
-
-        # Falling edge.
-        self._write_gpio(value)
+        self._exchange(
+            bytes([
+                value,
+                value | self.SCK,
+            ])
+        )
 
     def _clock_in_bit(self):
         """
@@ -338,41 +319,97 @@ class ADS54J40:
         The host samples SDO on the following rising edge.
         """
 
-        # Rising edge.
-        self._write_gpio(self.SCK)
-        time.sleep(self.half_period)
+        inputs = self._exchange(
+            bytes([
+                0,
+                self.SCK,
+            ])
+        )
 
-        # Sample SDO.
-        pins = self.gpio.read(peek=True)
-        bit = 1 if (pins & self.SDO) else 0
-
-        # Falling edge.
-        self._write_gpio(0)
-        time.sleep(self.half_period)
-
-        return bit
+        # The second sample corresponds to the rising edge.
+        return 1 if (inputs[1] & self.SDO) else 0
 
     # ==================================================================
     # Bit-level transfers
     # ==================================================================
 
     def _send_bits(self, value, nbits):
-        """Send nbits MSB first."""
+        """
+        Send nbits MSB first using one synchronous FTDI transfer.
+
+        For each SPI bit:
+
+            state 0: SCLK low, SDIO valid
+            state 1: SCLK high, SDIO valid
+
+        The FTDI hardware generates the timing between states.
+        """
+
+        outputs = bytearray(2 * nbits)
+
+        pos = 0
 
         for bit_index in range(nbits - 1, -1, -1):
             bit = (value >> bit_index) & 1
-            self._clock_out_bit(bit)
+            data = self.SDIO if bit else 0
+
+            # SCLK low, data already valid.
+            outputs[pos] = data
+
+            # Rising edge.
+            outputs[pos + 1] = data | self.SCK
+
+            pos += 2
+
+        # Return to SCLK low.
+        outputs.append(0)
+
+        self._exchange(outputs)
 
     def _read_bits(self, nbits):
-        """Read nbits MSB first from SDO."""
+        """
+        Read nbits MSB first.
+
+        ADS54J40 SDOUT changes on the SCLK falling edge,
+        so sample after the falling edge.
+        """
+
+        outputs = bytearray()
+
+        for _ in range(nbits):
+            # Rising edge
+            outputs.append(self.SCK)
+
+            # Falling edge
+            outputs.append(0)
+
+        inputs = self._exchange(outputs)
 
         value = 0
 
-        for _ in range(nbits):
-            value = (value << 1) | self._clock_in_bit()
+        if getattr(self, "verbose", False):
+            print("SDO samples:")
 
-        return value
+        for bit_index in range(nbits):
+            # Sample corresponding to the low-SCLK state after
+            # the falling edge.
+            sample = inputs[2 * bit_index + 1]
 
+            bit = 1 if (sample & self.SDO) else 0
+
+            if getattr(self, "verbose", False):
+                print(
+                    f"  bit {nbits - 1 - bit_index}: "
+                    f"FTDI input=0x{sample:02X} "
+                    f"SDO={'HIGH' if bit else 'LOW'}"
+                )
+
+            value = (value << 1) | bit
+
+        if getattr(self, "verbose", False):
+            print(f"  reconstructed value = 0x{value:02X}")
+
+        return value    
     # ==================================================================
     # SEN control
     # ==================================================================
@@ -382,28 +419,23 @@ class ADS54J40:
         Assert SEN.
 
         Result:
-
             SEN = 0
             SCK = 0
             SDIO = 0
-        """
 
-        self._write_gpio(0)
-        time.sleep(self.half_period)
+        Holds SEN low for a couple of quiet samples before the first
+        SCLK edge (tSLOADS >= 100 ns).
+        """
+        self._exchange(bytes([0, 0, 0]))
 
     def _end(self):
         """
         Finish SPI transaction and deassert SEN.
+
+        Returns to SCLK low, holds it quiet, then deasserts SEN
+        (tSLOADH >= 100 ns).
         """
-
-        # Ensure SCK is low.
-        self._write_gpio(0)
-        time.sleep(self.half_period)
-
-        # Deassert SEN.
-        self._write_gpio(self.SEN)
-        time.sleep(self.half_period)
-
+        self._exchange(bytes([0, 0, self.SEN]))    
     # ==================================================================
     # SPI header
     # ==================================================================
@@ -432,24 +464,16 @@ class ADS54J40:
             )
 
         if read not in (0, 1):
-            raise ValueError(
-                "read must be 0 or 1"
-            )
+            raise ValueError("read must be 0 or 1")
 
         if bank not in (0, 1):
-            raise ValueError(
-                "bank must be 0 or 1"
-            )
+            raise ValueError("bank must be 0 or 1")
 
         if page_access not in (0, 1):
-            raise ValueError(
-                "page_access must be 0 or 1"
-            )
+            raise ValueError("page_access must be 0 or 1")
 
         if channel not in (0, 1):
-            raise ValueError(
-                "channel must be 0 or 1"
-            )
+            raise ValueError("channel must be 0 or 1")
 
         return (
             (read << 15)
@@ -475,7 +499,12 @@ class ADS54J40:
         """
         Perform one complete 24-bit SPI write.
 
-        SEN is asserted only for this transaction.
+        SEN is asserted for the complete transaction:
+
+            SEN low
+            16-bit header
+            8-bit data
+            SEN high
         """
 
         if not 0 <= value <= 0xFF:
@@ -506,8 +535,11 @@ class ADS54J40:
             )
 
         self._begin()
-        self._send_bits(word, 24)
-        self._end()
+
+        try:
+            self._send_bits(word, 24)
+        finally:
+            self._end()
 
     def raw_read(
         self,
@@ -552,16 +584,12 @@ class ADS54J40:
 
         self._begin()
 
-        # Send read header.
-        self._send_bits(header, 16)
+        try:
+            self._send_bits(header, 16)
 
-        # Complete SCK-low period before first read clock.
-        time.sleep(self.half_period)
-
-        # Receive register value.
-        value = self._read_bits(8)
-
-        self._end()
+            value = self._read_bits(8)
+        finally:
+            self._end()
 
         if self.verbose:
             print(
@@ -593,7 +621,6 @@ class ADS54J40:
             raise ValueError(
                 f"Value must be 8-bit, got 0x{value:X}"
             )
-
         header = self._make_header(
             read=0,
             bank=bank,
@@ -605,6 +632,18 @@ class ADS54J40:
         word = (header << 8) | value
 
         self._send_bits(word, 24)
+
+        if self.verbose:
+            print(
+                f"WRITE: "
+                f"R/W=0 "
+                f"M={bank} "
+                f"P={page_access} "
+                f"CH={channel} "
+                f"ADDR=0x{address:03X} "
+                f"DATA=0x{value:02X} "
+                f"WORD=0x{word:06X}"
+            )
 
     def _raw_read_active(
         self,
@@ -628,12 +667,27 @@ class ADS54J40:
             address=address,
         )
 
+        if self.verbose:
+            print(
+                f"READ:  "
+                f"R/W=1 "
+                f"M={bank} "
+                f"P={page_access} "
+                f"CH={channel} "
+                f"ADDR=0x{address:03X} "
+                f"HEADER=0x{header:04X}"
+            )
+
         self._send_bits(header, 16)
 
-        # Complete SCK-low period before first read clock.
-        time.sleep(self.half_period)
+        value = self._read_bits(8)
 
-        return self._read_bits(8)
+        if self.verbose:
+            print(
+                f"       DATA=0x{value:02X}"
+            )
+
+        return value
 
     # ==================================================================
     # Page selection helpers
@@ -660,26 +714,12 @@ class ADS54J40:
     def _select_jesd_page_active(self, selector):
         """
         Select a normal JESD page while SEN is already low.
-
-        selector:
-
-            0x6800 -> Main Digital
-            0x6900 -> JESD Digital
-            0x6A00 -> JESD Analog
-            0x6100 -> Offset page selection
         """
 
         low = selector & 0xFF
         high = (selector >> 8) & 0xFF
 
-        # JESD Bank Page Selection
-        #
-        # M = 1
-        # P = 0
-        #
-        # 0x003 = low byte
-        # 0x004 = high byte
-
+        # Select JESD page.
         self._raw_write_active(
             0x003,
             low,
@@ -688,6 +728,16 @@ class ADS54J40:
             channel=0,
         )
 
+        # Enable independent channel control.
+        self._raw_write_active(
+            0x005,
+            0x01,
+            bank=1,
+            page_access=0,
+            channel=0,
+        )
+
+        # Select JESD page.
         self._raw_write_active(
             0x004,
             high,
@@ -696,12 +746,14 @@ class ADS54J40:
             channel=0,
         )
 
+
     def _select_offset_page_active(self, selector):
         """
         Select an offset page while SEN is already low.
 
-        This first selects 0x6100 through 0x003/0x004,
-        then selects either:
+        First selects 0x6100 through 0x003/0x004.
+
+        Then:
 
             0x0000 -> Offset Read
             0x0500 -> Offset Load
@@ -712,12 +764,7 @@ class ADS54J40:
         low = selector & 0xFF
         high = (selector >> 8) & 0xFF
 
-        # First select the Offset Read/Load selection page:
-        #
-        # 0x003 = 0x00
-        # 0x004 = 0x61
-        #
-        # => 0x6100
+        # Select 0x6100.
 
         self._raw_write_active(
             0x003,
@@ -735,10 +782,7 @@ class ADS54J40:
             channel=0,
         )
 
-        # Then select the actual offset subpage:
-        #
-        # 0x001 = low byte
-        # 0x002 = high byte
+        # Select offset subpage through 0x001/0x002.
 
         self._raw_write_active(
             0x001,
@@ -771,7 +815,7 @@ class ADS54J40:
 
         selector = self.PAGES[page]["selector"]
 
-        # Directly accessible page/register group.
+        # Directly accessible register group.
         if selector is None:
             return
 
@@ -847,39 +891,6 @@ class ADS54J40:
     ):
         """
         Read an arbitrary ADS54J40 register.
-
-        Parameters
-        ----------
-        page : str
-            One of:
-
-                analog_general
-                analog_page_select
-                analog_master
-                analog_adc
-
-                jesd_general
-                jesd_page_select
-                jesd_page_select1
-
-                jesd_main
-                jesd_digital
-                jesd_analog
-
-                offset_page_select
-                offset_read
-                offset_load
-
-        address : int
-            Register address.
-
-        channel : int
-            ADS54J40 CH bit, 0 or 1.
-
-        Returns
-        -------
-        int
-            8-bit register value.
         """
 
         spec = self._validate_page(
@@ -901,17 +912,18 @@ class ADS54J40:
 
         self._begin()
 
-        # If this is a paged register, select the page.
-        self._select_page_active(page)
+        try:
+            self._select_page_active(page)
 
-        value = self._raw_read_active(
-            address,
-            bank=spec["bank"],
-            page_access=spec["page_access"],
-            channel=channel,
-        )
+            value = self._raw_read_active(
+                address,
+                bank=spec["bank"],
+                page_access=spec["page_access"],
+                channel=channel,
+            )
 
-        self._end()
+        finally:
+            self._end()
 
         if self.verbose:
             print(
@@ -933,20 +945,6 @@ class ADS54J40:
     ):
         """
         Write an arbitrary ADS54J40 register.
-
-        Parameters
-        ----------
-        page : str
-            User-visible ADS54J40 page name.
-
-        address : int
-            Register address.
-
-        value : int
-            8-bit register value.
-
-        channel : int
-            ADS54J40 CH bit, 0 or 1.
         """
 
         spec = self._validate_page(
@@ -974,18 +972,43 @@ class ADS54J40:
 
         self._begin()
 
-        # Select page if necessary.
-        self._select_page_active(page)
+        try:
+            self._select_page_active(page)
 
-        self._raw_write_active(
-            address,
-            value,
-            bank=spec["bank"],
-            page_access=spec["page_access"],
-            channel=channel,
+            self._raw_write_active(
+                address,
+                value,
+                bank=spec["bank"],
+                page_access=spec["page_access"],
+                channel=channel,
+            )
+
+        finally:
+            self._end()
+
+    # ==================================================================
+    # Reset
+    # ==================================================================
+
+    def reset(self):
+        """
+        Perform an ADS54J40 software reset.
+
+        Register 0x000 is the global software-reset register.
+
+        0x81 -> software reset.
+        """
+
+        if self.verbose:
+            print("RESET: ADS54J40 software reset")
+
+        self.raw_write(
+            address=0x000,
+            value=0x81,
+            bank=0,
+            page_access=0,
+            channel=0,
         )
-
-        self._end()
 
     # ==================================================================
     # Multiple-register access
@@ -1009,23 +1032,11 @@ class ADS54J40:
                 ("jesd_analog", 0x16),
             ]
 
-        Or with explicit channel:
+        Or:
 
             [
                 ("jesd_digital", 0x06, 0),
                 ("jesd_digital", 0x06, 1),
-            ]
-
-        Returns a list of dictionaries:
-
-            [
-                {
-                    "page": "analog_master",
-                    "address": 0x20,
-                    "channel": 0,
-                    "value": 0x00,
-                },
-                ...
             ]
         """
 
@@ -1089,15 +1100,13 @@ class ADS54J40:
                 ("jesd_analog", 0x16, 0x40),
             ]
 
-        Or with explicit channel:
+        Or:
 
             [
                 ("jesd_digital", 0x06, 0x02, 0),
             ]
 
-        If verify=True, each value is read back after writing.
-
-        Returns a list of dictionaries describing the result.
+        If verify=True, read each register back.
         """
 
         old_verbose = self.verbose
@@ -1168,48 +1177,6 @@ class ADS54J40:
         return results
 
     # ==================================================================
-    # Configuration
-    # ==================================================================
-
-    def apply_config(
-        self,
-        config,
-        *,
-        verify=False,
-        verbose=None,
-    ):
-        """
-        Apply a register configuration.
-
-        The configuration is an iterable containing either:
-
-            (page, address, value)
-
-        or:
-
-            (page, address, value, channel)
-
-        Example:
-
-            config = [
-                ("analog_master", 0x20, 0x01),
-                ("jesd_main", 0x10, 0x02),
-                ("jesd_digital", 0x06, 0x40),
-            ]
-
-            adc.apply_config(
-                config,
-                verify=True,
-            )
-        """
-
-        return self.write_many(
-            config,
-            verify=verify,
-            verbose=verbose,
-        )
-
-    # ==================================================================
     # Convenience page-selection methods
     # ==================================================================
 
@@ -1221,10 +1188,7 @@ class ADS54J40:
             "master"
             "adc"
 
-        This is mainly useful for interactive/debugging work.
-
-        Normal register access should preferably use
-        read_register() / write_register().
+        Normally use read_register() / write_register().
         """
 
         page_map = {
@@ -1243,11 +1207,12 @@ class ADS54J40:
 
         self._begin()
 
-        self._select_analog_page_active(
-            selector
-        )
-
-        self._end()
+        try:
+            self._select_analog_page_active(
+                selector
+            )
+        finally:
+            self._end()
 
     def select_jesd_page(self, page):
         """
@@ -1258,8 +1223,7 @@ class ADS54J40:
             "digital"
             "analog"
 
-        Normal register access should preferably use
-        read_register() / write_register().
+        Normally use read_register() / write_register().
         """
 
         page_map = {
@@ -1280,11 +1244,12 @@ class ADS54J40:
 
         self._begin()
 
-        self._select_jesd_page_active(
-            selector
-        )
-
-        self._end()
+        try:
+            self._select_jesd_page_active(
+                selector
+            )
+        finally:
+            self._end()
 
     def select_offset_page(self, page):
         """
@@ -1294,8 +1259,7 @@ class ADS54J40:
             "offset_read"
             "offset_load"
 
-        Normal register access should preferably use
-        read_register() / write_register().
+        Normally use read_register() / write_register().
         """
 
         if page not in (
@@ -1313,11 +1277,12 @@ class ADS54J40:
 
         self._begin()
 
-        self._select_offset_page_active(
-            selector
-        )
-
-        self._end()
+        try:
+            self._select_offset_page_active(
+                selector
+            )
+        finally:
+            self._end()
 
     # ==================================================================
     # Backwards-compatible convenience functions
@@ -1390,6 +1355,38 @@ class ADS54J40:
             address,
             channel=channel,
         )
+    # #####################################################
+    # Startup sequence
+    ######################################################
+
+    def initialize(self):
+        """
+        Datasheet Table 9-1 startup sequence (LMFS = 8224).
+        Run once after power-up before accessing registers.
+        """
+        if self.verbose:
+            print("INIT: ADS54J40 startup sequence")
+
+        # 1. Software reset (general register 0x000, M=0, P=0)
+        self.raw_write(0x000, 0x81, bank=0, page_access=0, channel=0)
+
+        # 2. Clear unused JESD pages + select main digital page (4-001h..4-004h)
+        self._begin()
+        self._raw_write_active(0x001, 0x00, bank=1, page_access=0, channel=0)
+        self._raw_write_active(0x002, 0x00, bank=1, page_access=0, channel=0)
+        self._raw_write_active(0x003, 0x00, bank=1, page_access=0, channel=0)
+        self._raw_write_active(0x004, 0x68, bank=1, page_access=0, channel=0)
+        self._end()
+
+        # 3. DIG RESET the JESD bank (channel A, 6-0F7h)
+        self.write_register("jesd_main", 0x0F7, 0x01, channel=0)
+
+        # 4. Pulse reset for channel A (6-000h: 01 then 00)
+        self.write_register("jesd_main", 0x000, 0x01, channel=0)
+        self.write_register("jesd_main", 0x000, 0x00, channel=0)
+
+        # 5. Select master page, set ALWAYS WRITE 1 (0-059h)
+        self.write_register("analog_master", 0x059, 0x20)
 
     # ==================================================================
     # Cleanup
@@ -1397,16 +1394,17 @@ class ADS54J40:
 
     def close(self):
         """Close the FT245 GPIO interface."""
-
         self.gpio.close()
 
     def __enter__(self):
+        self.initialize()
         return self
-
     def __exit__(
         self,
         exc_type,
         exc_value,
         traceback,
     ):
-        self.close()    
+        self.close()
+
+
