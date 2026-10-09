@@ -1,6 +1,6 @@
 # Project Specific Excludes:
 notebooks/
-configs/
+configs/*
 !configs/LMKConfig.txt # Track the good config
 data/
 
