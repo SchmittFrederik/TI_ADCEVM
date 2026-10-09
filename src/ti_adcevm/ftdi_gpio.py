@@ -1,4 +1,4 @@
-from pyftdi.gpio import GpioAsyncController
+from pyftdi.gpio import GpioSyncController
 
 class ADSGpioSyncController(GpioSyncController):
 
