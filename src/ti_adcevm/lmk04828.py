@@ -31,6 +31,7 @@ SPI:
 import re
 import time
 
+from pyftdi.gpio import GpioAsyncController
 
 
 class LMK04828:
