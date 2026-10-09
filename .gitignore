@@ -1,6 +1,7 @@
 # Project Specific Excludes:
 notebooks/
 configs/
+!configs/LMKConfig.txt # Track the good config
 data/
 
 # Byte-compiled / optimized / DLL files
