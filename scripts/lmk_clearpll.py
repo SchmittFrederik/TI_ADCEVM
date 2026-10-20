@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from ti_adcevm.lmk04828 import LMK04828
-
+from time import sleep
 
 def check_pll(lmk):
     r182 = lmk.read_register(0x182)
@@ -50,6 +50,9 @@ def main():
 
     # Clear lock-lost flags
     clear_pll(lmk)
+
+    # pause 1s 
+    sleep(1)
 
     # Read status again
     post = check_pll(lmk)

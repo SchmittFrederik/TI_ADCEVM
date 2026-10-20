@@ -56,8 +56,7 @@ class LMK04828:
     # ------------------------------------------------------------------
 
     # Experimentally working timing:
-    # 100 us half-period -> 5 kHz SPI clock.
-    HALF_PERIOD = 100e-6
+    HALF_PERIOD = 10e-6
 
     # ------------------------------------------------------------------
     # LMK register definitions
