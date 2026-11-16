@@ -63,8 +63,15 @@ class LMK04828:
     RESET_PIN_INPUT = 0x32          # MUX = 6, TYPE = 2 (input with pull-down)
 
     # Registers whose readback is not expected to equal what was written:
-    # R0 (RESET self-clears), status/readback registers.
-    NO_VERIFY = {0x000, 0x182, 0x183, 0x184, 0x185, 0x188}
+    # R0 (RESET self-clears), read-only ID registers (0x006 is the mask
+    # revision), status/readback registers (0x189..0x18B undocumented,
+    # read back as non-zero on the EVM) and SPI_LOCK (reads back 0).
+    NO_VERIFY = {
+        0x000,
+        0x003, 0x004, 0x005, 0x006, 0x00C, 0x00D,
+        0x182, 0x183, 0x184, 0x185, 0x188, 0x189, 0x18A, 0x18B,
+        0x1FFD, 0x1FFE, 0x1FFF,
+    }
 
     MAX_ADDRESS = 0x1FFF
 
