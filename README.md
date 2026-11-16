@@ -36,6 +36,7 @@ Opening an `ADS54J40` does not reset or configure the ADC; call
 | `lmk_write.py`         | Write one LMK register                                          |
 | `lmk_status.py`        | PLL lock, reference, LOS, holdover and DAC status               |
 | `lmk_clearpll.py`      | Clear the PLL lock-lost flags and re-check                      |
+| `lmk_pll1_diag.py`     | Log PLL1 lock detect and VCXO tuning voltage over time          |
 | `lmk_checkconfig.py`   | Offline: decode a register file into PLL/SYSREF/output clocks   |
 | `translateticsfile.py` | Offline: annotate a TICS Pro file with decoded address/value    |
 | `ads_flash.py`         | Reset the ADC and configure the JESD204B link (LMFS 4211)       |
