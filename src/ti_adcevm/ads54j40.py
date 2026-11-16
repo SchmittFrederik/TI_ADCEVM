@@ -21,6 +21,7 @@ same SEN-low cycle before the actual access. Example:
         adc.write_register("jesd_analog", 0x16, 0x02, channel=1)
 """
 
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -83,7 +84,13 @@ class ADS54J40:
     # so 500 ns gives ~1 MHz SCLK (datasheet max 2 MHz, setup/hold 100 ns).
     HALF_PERIOD = 500e-9
 
-    def __init__(self, url=DEFAULT_URL, *, half_period=HALF_PERIOD, verbose=0):
+    # Wait after a page change before the next access. On hardware the first
+    # frame right after a JESD page select was lost (it went to the old page)
+    # when the select and the access shared one SEN cycle.
+    PAGE_SETTLE = 1e-3
+
+    def __init__(self, url=DEFAULT_URL, *, half_period=HALF_PERIOD, verbose=0,
+                 page_dummy_read=True):
         """
         Open the FTDI interface. Does not touch the ADC.
 
@@ -92,12 +99,16 @@ class ADS54J40:
 
         verbose: 0 = quiet, 1 = log every SPI frame,
                  2 = additionally dump every sampled SDOUT bit.
+        page_dummy_read: after every page change, do one throwaway read in
+                 the new page before the real access.
         """
 
         if half_period <= 0:
             raise ValueError("half_period must be positive")
 
         self.verbose = verbose
+        self.page_dummy_read = page_dummy_read
+        self._forget_pages()
         self.gpio = SyncGpioController()
         self.gpio.configure(
             url,
@@ -228,20 +239,74 @@ class ADS54J40:
 
         return value
 
+    def _frames(self, writes):
+        """Write several (address, value, m, p) frames in one SEN cycle."""
+
+        self._begin()
+        try:
+            for address, value, m, p in writes:
+                self._write_frame(address, value, m=m, p=p)
+        finally:
+            self._end()
+
+    def _settle_after_page_change(self, m, p, address):
+        """Wait PAGE_SETTLE, then optionally do a throwaway read in the new page."""
+
+        time.sleep(self.PAGE_SETTLE)
+        if self.page_dummy_read:
+            self._begin()
+            try:
+                self._read_frame(address, m=m, p=p)
+            finally:
+                self._end()
+
+    def _forget_pages(self):
+        """Mark the page-select registers as unknown (forces a full re-select)."""
+
+        self._analog_page = None        # last value written to 0-011h
+        self._jesd_page = None          # last (PAGE SEL, PAGE SEL1) written
+        self._broadcast_disabled = None
+
     def _select_page(self, page):
-        """Write the page-select registers for page (SEN already low)."""
+        """
+        Make page the selected page, if it is not already.
 
-        if page.analog_page is not None:
-            self._write_frame(self.REG_ANALOG_PAGE, page.analog_page)
+        Page selects run in their own SEN cycle, followed by PAGE_SETTLE
+        and (optionally) a throwaway read in the new page. Unchanged page
+        registers are not rewritten.
+        """
 
-        if page.jesd_page is not None:
-            # Datasheet Table 9-3 order. 4-005h = 01h disables broadcast so
-            # the CH bit addresses channel A and B individually.
-            self._write_frame(self.REG_BROADCAST, 0x01, m=1)
-            self._write_frame(self.REG_JESD_PAGE_HI, page.jesd_page >> 8, m=1)
-            self._write_frame(self.REG_JESD_PAGE_LO, page.jesd_page & 0xFF, m=1)
-            self._write_frame(self.REG_JESD_PAGE1_HI, page.jesd_page1 >> 8, m=1)
-            self._write_frame(self.REG_JESD_PAGE1_LO, page.jesd_page1 & 0xFF, m=1)
+        changed = False
+
+        if page.analog_page is not None and page.analog_page != self._analog_page:
+            self._frames([(self.REG_ANALOG_PAGE, page.analog_page, 0, 0)])
+            self._analog_page = page.analog_page
+            changed = True
+
+        target = (page.jesd_page, page.jesd_page1)
+        if page.jesd_page is not None and (
+            target != self._jesd_page or not self._broadcast_disabled
+        ):
+            self._begin()
+            try:
+                # 4-005h = 01h disables broadcast so the CH bit addresses
+                # channel A and B individually. Page MSB (4-004h) is written
+                # last, as in the datasheet sequences.
+                if not self._broadcast_disabled:
+                    self._write_frame(self.REG_BROADCAST, 0x01, m=1)
+                if self._jesd_page is None or self._jesd_page[1] != page.jesd_page1:
+                    self._write_frame(self.REG_JESD_PAGE1_HI, page.jesd_page1 >> 8, m=1)
+                    self._write_frame(self.REG_JESD_PAGE1_LO, page.jesd_page1 & 0xFF, m=1)
+                self._write_frame(self.REG_JESD_PAGE_LO, page.jesd_page & 0xFF, m=1)
+                self._write_frame(self.REG_JESD_PAGE_HI, page.jesd_page >> 8, m=1)
+            finally:
+                self._end()
+            self._broadcast_disabled = True
+            self._jesd_page = target
+            changed = True
+
+        if changed:
+            self._settle_after_page_change(page.m, page.p, page.addresses.start)
 
     def _get_page(self, page_name, address):
         """Look up a page by name and check that address belongs to it."""
@@ -270,10 +335,10 @@ class ADS54J40:
         """Read one register. channel (0 = A, 1 = B) only matters for JESD pages."""
 
         spec = self._get_page(page, address)
+        self._select_page(spec)
 
         self._begin()
         try:
-            self._select_page(spec)
             value = self._read_frame(address, m=spec.m, p=spec.p, channel=channel)
         finally:
             self._end()
@@ -285,10 +350,10 @@ class ADS54J40:
 
         spec = self._get_page(page, address)
         _check_byte(value)
+        self._select_page(spec)
 
         self._begin()
         try:
-            self._select_page(spec)
             self._write_frame(address, value, m=spec.m, p=spec.p, channel=channel)
         finally:
             self._end()
@@ -348,6 +413,7 @@ class ADS54J40:
             self._write_frame(self.REG_RESET, 0x81)
         finally:
             self._end()
+        self._forget_pages()
 
     def initialize(self):
         """
@@ -362,30 +428,30 @@ class ADS54J40:
 
         self.reset()
 
-        self._begin()
-        try:
-            # Re-enable broadcast (the power-on default) so the JESD bank
-            # resets below hit both channels. This driver disables
-            # broadcast on every JESD access, and the analog-bank reset
-            # above does not restore it.
-            self._write_frame(self.REG_BROADCAST, 0x00, m=1)
+        # Re-enable broadcast (the power-on default) so the JESD bank resets
+        # below hit both channels: this driver disables broadcast on every
+        # JESD access, and the analog-bank reset above does not restore it.
+        # Then clear the unused page-select registers and select main digital.
+        self._frames([
+            (self.REG_BROADCAST, 0x00, 1, 0),
+            (self.REG_JESD_PAGE1_LO, 0x00, 1, 0),
+            (self.REG_JESD_PAGE1_HI, 0x00, 1, 0),
+            (self.REG_JESD_PAGE_LO, 0x00, 1, 0),
+            (self.REG_JESD_PAGE_HI, 0x68, 1, 0),
+        ])
+        self._settle_after_page_change(m=1, p=1, address=0x000)
 
-            # Clear the unused page-select registers, select main digital.
-            self._write_frame(self.REG_JESD_PAGE1_LO, 0x00, m=1)
-            self._write_frame(self.REG_JESD_PAGE1_HI, 0x00, m=1)
-            self._write_frame(self.REG_JESD_PAGE_LO, 0x00, m=1)
-            self._write_frame(self.REG_JESD_PAGE_HI, 0x68, m=1)
+        # DIG RESET (self-clearing), then pulse PULSE RESET.
+        self._frames([(0x0F7, 0x01, 1, 1), (0x000, 0x01, 1, 1), (0x000, 0x00, 1, 1)])
 
-            # DIG RESET (self-clearing), then pulse PULSE RESET.
-            self._write_frame(0x0F7, 0x01, m=1, p=1)
-            self._write_frame(0x000, 0x01, m=1, p=1)
-            self._write_frame(0x000, 0x00, m=1, p=1)
+        # Master page: set the ALWAYS WRITE 1 bit in 0-059h.
+        self._frames([(self.REG_ANALOG_PAGE, 0x80, 0, 0)])
+        self._settle_after_page_change(m=0, p=0, address=0x059)
+        self._frames([(0x059, 0x20, 0, 0)])
 
-            # Master page: set the ALWAYS WRITE 1 bit in 0-059h.
-            self._write_frame(self.REG_ANALOG_PAGE, 0x80)
-            self._write_frame(0x059, 0x20)
-        finally:
-            self._end()
+        self._analog_page = 0x80
+        self._jesd_page = (0x6800, 0x0000)
+        self._broadcast_disabled = False
 
     # ==================================================================
     # Cleanup

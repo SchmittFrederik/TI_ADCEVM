@@ -36,6 +36,7 @@ Use `pdftotext -layout` to search them.
 | `translateticsfile.py IN OUT` | Offline: annotate a TICS file with decoded address/value |
 | `ads_flash.py [--k 8] [-v]` | ADC reset sequence (datasheet Table 9-1) + JESD config LMFS 4244, subclass 1. Checks K/SYSREF validity first, verifies each write |
 | `ads_read.py PAGE ADDR [-c CH]`, `ads_write.py PAGE ADDR VALUE [-c CH] [--verify]` | Single ADC register |
+| `ads_page_probe.py [-c CH]` | Diagnose register writes/reads after page changes (overwrites K/PLL mode/swing; re-run ads_flash after) |
 
 LMK scripts take `--mode 3wire|4wire` (which readback path the chip is currently in, default 3wire).
 ADC scripts take `-v`/`-vv`. ADC pages: `analog_general, analog_master, analog_adc, jesd_general,
@@ -88,6 +89,11 @@ and `R0 = 0x00` (back to 3-wire). Run `lmk_checkconfig.py` to see it decoded.
 - Registers that never read back as written (in `LMK04828.NO_VERIFY`): R0 (self-clearing RESET),
   read-only IDs 0x003–0x006/0x00C/0x00D (0x006 reads 0x20), status 0x182–0x18B, SPI_LOCK 0x1FFD–0x1FFF.
 - LMK04828 RESET pin (D6) hardware reset only works in 3-wire mode (in 4-wire the LMK drives that pin).
+- **ADS54J40 page switching:** on hardware, the first SPI frame right after a JESD page select (sent in
+  the same SEN cycle) landed in the *previous* page. That looked like "registers only read back after
+  leaving the page once". The driver now caches the selected page, selects pages in their own SEN
+  cycle, waits `PAGE_SETTLE` (1 ms) and does a throwaway read (`page_dummy_read=True`).
+  `scripts/ads_page_probe.py` reproduces it under three settings. Not documented in the datasheet.
 - ADS54J40: opening the driver does **not** reset the chip; call `initialize()` explicitly (`ads_flash.py`
   does). Every JESD-bank access writes 4-005h = 01 (per-channel, broadcast off) plus the page selects.
   JESD link: **LMFS 4244** (L=4, M=2, F=4, S=4, N'=16), 8.0 Gbps/lane at 800 MSPS, FPGA core clock
