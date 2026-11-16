@@ -62,7 +62,7 @@ class LMK04828:
 
     MAX_ADDRESS = 0x1FFF
 
-    def __init__(self, url=DEFAULT_URL, initial_mode="3wire"):
+    def __init__(self, url=DEFAULT_URL, initial_mode="3wire", half_period=HALF_PERIOD):
         """
         Open the FTDI interface. Does not touch the LMK.
 
@@ -70,12 +70,18 @@ class LMK04828:
         currently in. This only selects which pin the driver reads from;
         use enable_3wire_readback()/enable_4wire_readback() to change
         the chip's mode.
+
+        half_period: wait in seconds after every GPIO change. Increase it
+        if readback is unreliable (e.g. slow open-drain SDIO rise times).
         """
 
         if initial_mode not in ("3wire", "4wire"):
             raise ValueError("initial_mode must be '3wire' or '4wire'")
+        if half_period < 0:
+            raise ValueError("half_period must not be negative")
 
         self.spi_3wire = initial_mode == "3wire"
+        self.half_period = half_period
 
         self.gpio = GpioAsyncController()
         self.gpio.configure(
@@ -99,16 +105,22 @@ class LMK04828:
         """Drive the output pins and wait half an SPI clock period."""
 
         self.gpio.write(pins)
-        time.sleep(self.HALF_PERIOD)
+        time.sleep(self.half_period)
 
-    def _send_bits(self, value, nbits):
-        """Shift out nbits of value on SDIO, MSB first. Ends with SCK low."""
+    def _send_bits(self, value, nbits, end_low=True):
+        """
+        Shift out nbits of value on SDIO, MSB first.
+
+        With end_low=False the last bit is left with SCK high, so the
+        caller can do something before the final falling edge.
+        """
 
         for i in range(nbits - 1, -1, -1):
             data = self.ACTIVE | (SDIO if (value >> i) & 1 else 0)
             self._set(data)
             self._set(data | SCK)
-        self._set(self.ACTIVE)
+        if end_low:
+            self._set(self.ACTIVE)
 
     def _read_bits(self, nbits, pin):
         """
@@ -138,16 +150,22 @@ class LMK04828:
 
         self._set(self.ACTIVE)
         try:
-            self._send_bits(command, 16)
+            # Stop with SCK high after the last address bit (already
+            # latched by the LMK). The LMK starts driving D7 on the next
+            # falling edge.
+            self._send_bits(command, 16, end_low=False)
 
             if self.spi_3wire:
-                # Release SDIO so the LMK can drive it.
+                # Release SDIO *before* that falling edge, so the FTDI is
+                # not still forcing the line low when the LMK takes over.
                 self.gpio.set_direction(SDIO, 0)
                 try:
+                    self._set(self.ACTIVE)
                     value = self._read_bits(8, SDIO)
                 finally:
                     self.gpio.set_direction(SDIO, SDIO)
             else:
+                self._set(self.ACTIVE)
                 value = self._read_bits(8, LMK_SDO)
         finally:
             self._set(self.IDLE)
