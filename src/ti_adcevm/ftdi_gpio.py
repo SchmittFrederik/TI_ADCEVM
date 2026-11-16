@@ -21,9 +21,14 @@ LMK_CS = 0x10   # D4 -> LMK CS* (active low)
 LMK_SDO = 0x40  # D6 <-> LMK RESET/GPO pin (4-wire SDO, or hardware reset)
 
 
-class ADSGpioSyncController(GpioSyncController):
+class SyncGpioController(GpioSyncController):
     """
-    GpioSyncController with a more patient exchange().
+    GpioSyncController with a more patient exchange(). Used by both drivers.
+
+    In synchronous bit-bang mode every output byte produces one input
+    sample, taken by the FTDI right *before* that byte is applied. So
+    inputs[k] shows the pins as set by outputs[k - 1], with hardware
+    timing and no dependence on USB or OS scheduling.
 
     PyFtdi's stock exchange() gives up after 4 read attempts, which is
     not enough for the longer waveforms used here. This version waits
@@ -42,3 +47,7 @@ class ADSGpioSyncController(GpioSyncController):
 
         self._ftdi.write_data(out)
         return bytes(self._ftdi.read_data_bytes(len(out), attempt=50))
+
+
+# Old name, kept for existing notebooks/scripts.
+ADSGpioSyncController = SyncGpioController

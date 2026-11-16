@@ -26,9 +26,15 @@ the tracked mode automatically.
 import re
 import time
 
-from pyftdi.gpio import GpioAsyncController
-
-from ti_adcevm.ftdi_gpio import ADC_SEN, DEFAULT_URL, LMK_CS, LMK_SDO, SCK, SDIO
+from ti_adcevm.ftdi_gpio import (
+    ADC_SEN,
+    DEFAULT_URL,
+    LMK_CS,
+    LMK_SDO,
+    SCK,
+    SDIO,
+    SyncGpioController,
+)
 
 
 class LMK04828:
@@ -41,10 +47,10 @@ class LMK04828:
     IDLE = LMK_CS | ADC_SEN       # LMK deselected, ADC deselected
     ACTIVE = ADC_SEN              # LMK selected (CS low)
 
-    # Wait after each GPIO change. Every write is a separate USB
-    # transaction, which already dominates the timing; this is the
-    # experimentally working value.
-    HALF_PERIOD = 10e-6
+    # Duration of one GPIO sample (synchronous bit-bang, hardware timed).
+    # One SCK period takes two samples: 5 us gives a 100 kHz SCK, far
+    # below the LMK's 20 MHz limit.
+    HALF_PERIOD = 5e-6
 
     # Register 0x000
     R0 = 0x000
@@ -71,23 +77,23 @@ class LMK04828:
         use enable_3wire_readback()/enable_4wire_readback() to change
         the chip's mode.
 
-        half_period: wait in seconds after every GPIO change. Increase it
-        if readback is unreliable (e.g. slow open-drain SDIO rise times).
+        half_period: duration of one GPIO sample in seconds (half an SCK
+        period). Increase it to slow the bus down.
         """
 
         if initial_mode not in ("3wire", "4wire"):
             raise ValueError("initial_mode must be '3wire' or '4wire'")
-        if half_period < 0:
-            raise ValueError("half_period must not be negative")
+        if half_period <= 0:
+            raise ValueError("half_period must be positive")
 
         self.spi_3wire = initial_mode == "3wire"
         self.half_period = half_period
 
-        self.gpio = GpioAsyncController()
+        self.gpio = SyncGpioController()
         self.gpio.configure(
             url,
             direction=self.OUTPUT_PINS,
-            frequency=100_000,
+            frequency=1.0 / half_period,
             initial=self.IDLE,
         )
 
@@ -98,44 +104,56 @@ class LMK04828:
         return "3-wire" if self.spi_3wire else "4-wire"
 
     # ==================================================================
-    # Bit level
+    # Waveform level
     # ==================================================================
+    #
+    # Transactions are built as byte waveforms and clocked out with
+    # SyncGpioController.exchange(). inputs[k] is the pin state sampled
+    # right before outputs[k] is applied, i.e. the state set by outputs[k-1].
 
-    def _set(self, pins):
-        """Drive the output pins and wait half an SPI clock period."""
+    def _exchange(self, outputs):
+        """Clock out a GPIO waveform and return the sampled inputs."""
 
-        self.gpio.write(pins)
-        time.sleep(self.half_period)
+        outputs = bytes(outputs)
+        inputs = self.gpio.exchange(outputs)
+        if len(inputs) != len(outputs):
+            raise RuntimeError(
+                f"FTDI exchange length mismatch: sent {len(outputs)} bytes, "
+                f"received {len(inputs)} bytes"
+            )
+        return inputs
 
-    def _send_bits(self, value, nbits, end_low=True):
+    def _bits_waveform(self, value, nbits):
         """
-        Shift out nbits of value on SDIO, MSB first.
+        Waveform shifting out nbits of value on SDIO, MSB first.
 
-        With end_low=False the last bit is left with SCK high, so the
-        caller can do something before the final falling edge.
+        Each bit is SCK low with data valid, then SCK high (the LMK
+        latches SDIO on that rising edge). Ends with SCK high.
         """
 
+        out = bytearray()
         for i in range(nbits - 1, -1, -1):
             data = self.ACTIVE | (SDIO if (value >> i) & 1 else 0)
-            self._set(data)
-            self._set(data | SCK)
-        if end_low:
-            self._set(self.ACTIVE)
+            out += bytes([data, data | SCK])
+        return out
 
-    def _read_bits(self, nbits, pin):
+    def _read_waveform(self, nbits):
         """
-        Clock in nbits from pin (SDIO or LMK_SDO), MSB first.
+        Waveform for nbits read clocks, starting from SCK high.
 
-        The LMK changes readback data on the falling SCK edge, so each
-        bit is sampled while SCK is high.
+        Begins with the falling edge after the last command bit, on which
+        the LMK puts out D7. Then per bit: SCK high, SCK low. The LMK
+        changes data on falling edges, so bit i is sampled while SCK is
+        high: in inputs[2 + 2*i] relative to the start of this waveform.
         """
 
+        return bytes([self.ACTIVE] + [self.ACTIVE | SCK, self.ACTIVE] * nbits)
+
+    @staticmethod
+    def _decode(inputs, offset, nbits, pin):
         value = 0
-        for _ in range(nbits):
-            self._set(self.ACTIVE | SCK)
-            bit = 1 if self.gpio.read(peek=True) & pin else 0
-            value = (value << 1) | bit
-            self._set(self.ACTIVE)
+        for i in range(nbits):
+            value = (value << 1) | (1 if inputs[offset + 2 + 2 * i] & pin else 0)
         return value
 
     # ==================================================================
@@ -146,29 +164,27 @@ class LMK04828:
         """Read one register using the currently tracked readback mode."""
 
         _check_address(address)
-        command = (1 << 15) | address
 
-        self._set(self.ACTIVE)
-        try:
-            # Stop with SCK high after the last address bit (already
-            # latched by the LMK). The LMK starts driving D7 on the next
-            # falling edge.
-            self._send_bits(command, 16, end_low=False)
+        # CS low, then the 16-bit read command. It ends with SCK high after
+        # the last address bit; the LMK drives D7 after the next falling edge.
+        command = bytes([self.ACTIVE] * 2) + self._bits_waveform((1 << 15) | address, 16)
 
-            if self.spi_3wire:
-                # Release SDIO *before* that falling edge, so the FTDI is
-                # not still forcing the line low when the LMK takes over.
-                self.gpio.set_direction(SDIO, 0)
-                try:
-                    self._set(self.ACTIVE)
-                    value = self._read_bits(8, SDIO)
-                finally:
-                    self.gpio.set_direction(SDIO, SDIO)
-            else:
-                self._set(self.ACTIVE)
-                value = self._read_bits(8, LMK_SDO)
-        finally:
-            self._set(self.IDLE)
+        if self.spi_3wire:
+            self._exchange(command)
+            # Release SDIO *before* that falling edge, so the FTDI is not
+            # driving the line when the LMK takes over.
+            self.gpio.set_direction(SDIO, 0)
+            try:
+                inputs = self._exchange(self._read_waveform(8))
+                value = self._decode(inputs, 0, 8, SDIO)
+            finally:
+                # Deselect while SDIO is still an input, then drive it again.
+                self._exchange([self.ACTIVE, self.IDLE])
+                self.gpio.set_direction(SDIO, SDIO)
+        else:
+            outputs = command + self._read_waveform(8) + bytes([self.ACTIVE, self.IDLE])
+            inputs = self._exchange(outputs)
+            value = self._decode(inputs, len(command), 8, LMK_SDO)
 
         return value
 
@@ -183,11 +199,11 @@ class LMK04828:
         if not 0 <= value <= 0xFF:
             raise ValueError(f"Register value must be 0x00..0xFF, got 0x{value:X}")
 
-        self._set(self.ACTIVE)
-        try:
-            self._send_bits((address << 8) | value, 24)
-        finally:
-            self._set(self.IDLE)
+        self._exchange(
+            bytes([self.ACTIVE] * 2)
+            + self._bits_waveform((address << 8) | value, 24)
+            + bytes([self.ACTIVE, self.ACTIVE, self.IDLE])
+        )
 
         if address == self.R0:
             self.spi_3wire = not value & self.SPI_3WIRE_DIS
@@ -230,9 +246,9 @@ class LMK04828:
 
         self.gpio.set_direction(LMK_SDO, LMK_SDO)
         try:
-            self.gpio.write(self.IDLE | LMK_SDO)
+            self._exchange([self.IDLE | LMK_SDO])
             time.sleep(duration)
-            self.gpio.write(self.IDLE)
+            self._exchange([self.IDLE])
             time.sleep(duration)
         finally:
             self.gpio.set_direction(LMK_SDO, 0)
@@ -351,6 +367,17 @@ class LMK04828:
         for index, (address, value) in enumerate(registers, start=1):
             print(f"[{index:4d}/{total}] R0x{address:03X} <- 0x{value:02X}")
             self.write_register(address, value)
+
+        reset_pin = dict(registers).get(self.RESET_PIN_CONFIG, 0x02)
+        if not self.spi_3wire and (reset_pin >> 3) & 0x07 != 6:
+            message = (
+                "The file leaves the LMK in 4-wire mode (R0[4] = 1), but 0x14A does "
+                "not route SPI readback to the RESET pin, so no register can be read "
+                "back. Add 'R0 0x000000' at the end of the file to return to 3-wire."
+            )
+            if verify:
+                raise RuntimeError(message)
+            print(f"WARNING: {message}")
 
         if verify:
             expected = {a: v for a, v in registers if a not in self.NO_VERIFY}

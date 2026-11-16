@@ -31,7 +31,7 @@ from ti_adcevm.ftdi_gpio import (
     LMK_CS,
     SCK,
     SDIO,
-    ADSGpioSyncController,
+    SyncGpioController,
 )
 
 
@@ -98,7 +98,7 @@ class ADS54J40:
             raise ValueError("half_period must be positive")
 
         self.verbose = verbose
-        self.gpio = ADSGpioSyncController()
+        self.gpio = SyncGpioController()
         self.gpio.configure(
             url,
             direction=self.OUTPUT_PINS,

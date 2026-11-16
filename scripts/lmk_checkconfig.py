@@ -340,7 +340,8 @@ def calculate_dclk(registers, output, distribution_mhz):
     else:
         frequency = distribution_mhz / divider
 
-    # Check whether output is enabled
+    # Divider output, also fed to SDCLKoutY when SDCLKoutY_MUX = 0.
+    device_clock = frequency
 
     powered_down = (
         group_pd
@@ -360,6 +361,7 @@ def calculate_dclk(registers, output, distribution_mhz):
 
     return {
         "frequency": frequency,
+        "device_clock": device_clock,
         "divider": divider,
         "divider_code": divider_code,
         "mux": mux,
@@ -391,8 +393,9 @@ def calculate_sdclk(registers, output, distribution_mhz, sysref):
     group_pd = bool(r["power"] & 0x08)
 
     if mux == 0:
-        source = "Device clock"
-        frequency = distribution_mhz
+        # Same divided clock as the paired DCLKoutX output.
+        source = "Device clock (= DCLKout)"
+        frequency = calculate_dclk(registers, output - 1, distribution_mhz)["device_clock"]
 
     else:
         source = "SYSREF"
