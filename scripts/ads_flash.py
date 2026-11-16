@@ -6,12 +6,18 @@ Runs the datasheet reset sequence (Table 9-1) and then programs both
 channels for LMFS = 4244: 4 lanes per device (2 per ADC), M=2, F=4, S=4,
 no decimation, 40X SERDES PLL. Every written register is read back.
 
+The write order and the "always write 1" registers follow TI's EVM GUI
+file configs/evmgui/Configuration Files/ADS54J40_LMF_4244.cfg.
+
 Active lanes: DA1, DA2, DB1, DB2 (EVM FMC DP4, DP6, DP0, DP2).
-DA0/DA3/DB0/DB3 are powered down.
+--pdn-unused-lanes tri-states DA0/DA3/DB0/DB3 (TI's file leaves them on).
+
+Needs the ADC sample clock running (LMK DCLKout2, LVPECL on this EVM):
+the JESD blocks don't accept or return register values without it.
 
 Usage:
 
-    ./ads_flash.py [--k 8] [--sample-msps 800] [--sysref-mhz 3.125] [-v]
+    ./ads_flash.py [--k 8] [--sample-msps 800] [--sysref-mhz 3.125] [--pdn-unused-lanes] [-v]
 """
 
 import argparse
@@ -24,19 +30,23 @@ from ti_adcevm.ads54j40 import ADS54J40
 L, M, F, S = 4, 2, 4, 4
 N_PRIME = 16                # bits per sample on the link
 SUBCLASS = 1                # 1 = subclass 1 (deterministic latency via SYSREF)
-PDN_UNUSED_LANES = True     # tri-state DA0/DA3/DB0/DB3
 
 CHANNELS = (0, 1)
 
 # JESD digital page (6900h)
 CTRL_K = 0x80                       # 0x000 bit 7: use K from register 0x006
-JESD_MODE_FILTER = 0x02             # 0x001: JESD FILTER = 000, JESD MODE = 010 (4244)
+JESD_MODE_FILTER = 0x02             # 0x001: JESD FILTER = 000, JESD MODE = 010 (4244; 4211 is 0x04)
 SUBCLASS_REG = SUBCLASS << 3        # 0x007 bit 3
+DIG_ALWAYS_1 = 0x80                 # 0x016 bit 7: must write 1
 
 # JESD analog page (6A00h)
+ANA_ALWAYS_1 = 0x02                 # 0x012 bit 1: must write 1
 JESD_PLL_MODE_40X = 0x02            # 0x016: 40X mode, two lanes per ADC
 PLL_RESET = 0x40                    # 0x017 bit 6
 LANE_PDN = 0x28                     # 0x017 bits 5 and 3 (LANE PDN 1 + 0)
+
+# Offset read page (6100h / 0000h)
+OFFSET_ALWAYS_1 = 0x02              # 0x068 bit 1: must write 1
 
 
 def banner(title):
@@ -90,28 +100,41 @@ def write_verify(adc, channel, page, address, value, description):
     return ok
 
 
-def configure(adc, k):
-    """Program the JESD link on both channels. Returns a list of pass/fail results."""
+def configure(adc, k, pdn_unused_lanes):
+    """
+    Program the JESD link on both channels, in the order of TI's
+    ADS54J40_LMF_4244.cfg. Returns a list of pass/fail results.
+
+    The "always write 1" bits are write-only (type W in the datasheet)
+    and are written without readback.
+    """
 
     results = []
-    lane_pdn = LANE_PDN if PDN_UNUSED_LANES else 0x00
+    lane_pdn = LANE_PDN if pdn_unused_lanes else 0x00
 
     for ch in CHANNELS:
         print(f"--- Channel {ch} ---")
 
         results += [
-            write_verify(adc, ch, "jesd_digital", 0x000, CTRL_K, "CTRL K enable"),
-            write_verify(adc, ch, "jesd_digital", 0x006, k - 1, "K - 1"),
             write_verify(adc, ch, "jesd_digital", 0x001, JESD_MODE_FILTER, "JESD MODE/FILTER"),
             write_verify(adc, ch, "jesd_digital", 0x007, SUBCLASS_REG, "SUBCLASS"),
-            write_verify(adc, ch, "jesd_analog", 0x016, JESD_PLL_MODE_40X, "JESD PLL MODE"),
+            write_verify(adc, ch, "jesd_digital", 0x000, CTRL_K, "CTRL K enable"),
+            write_verify(adc, ch, "jesd_digital", 0x006, k - 1, "K - 1"),
         ]
+        adc.write_register("jesd_digital", 0x016, DIG_ALWAYS_1, channel=ch)
+        adc.write_register("jesd_analog", 0x012, ANA_ALWAYS_1, channel=ch)
+
+        results.append(
+            write_verify(adc, ch, "jesd_analog", 0x016, JESD_PLL_MODE_40X, "JESD PLL MODE")
+        )
 
         # Pulse PLL RESET (Table 9-1 step 4), keeping the lane power-down bits.
         adc.write_register("jesd_analog", 0x017, lane_pdn | PLL_RESET, channel=ch)
         results.append(
             write_verify(adc, ch, "jesd_analog", 0x017, lane_pdn, "PLL reset/LANE PDN")
         )
+
+        adc.write_register("offset_read", 0x068, OFFSET_ALWAYS_1, channel=ch)
 
     return results
 
@@ -124,6 +147,8 @@ def main():
                         help="ADC sample clock from the LMK, for the rate check (default 800)")
     parser.add_argument("--sysref-mhz", type=float, default=3.125,
                         help="SYSREF frequency from the LMK, for the check (default 3.125)")
+    parser.add_argument("--pdn-unused-lanes", action="store_true",
+                        help="power down the unused lanes DA0/DA3/DB0/DB3")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="log SPI frames")
     args = parser.parse_args()
 
@@ -138,7 +163,7 @@ def main():
             adc.initialize()
 
             banner(f"Configuring LMFS {L}{M}{F}{S}, K={args.k}")
-            results = configure(adc, args.k)
+            results = configure(adc, args.k, args.pdn_unused_lanes)
 
     except (ValueError, RuntimeError, OSError) as error:
         print(f"ERROR: {error}", file=sys.stderr)

@@ -57,6 +57,12 @@ Typical bring-up: `lmk_flash.py configs/LMKConfig.txt --verify` → wait a few s
   Spec at the pin: 0.35–2.4 Vpp. OSCin: 122.88 MHz VCXO (Y1). PLL1 loop filter is slow (39 kΩ / 68 µF).
 - Outputs: DCLKout0 → FPGA JESD clock, SDCLKout1 → FPGA SYSREF, DCLKout2 → ADC sample clock,
   SDCLKout3 → ADC SYSREF (AC coupled), DCLKout12 → FPGA CLK_LAO0.
+- **DCLKout2 and SDCLKout3 must be LVPECL** (0x10F = 0x66, LVPECL 2000 mV): the ADC clock/SYSREF nets
+  have 240 Ω emitter resistors (R43/R44, R46/R47). TI's GUI configs use this. LVDS (0x11) there gave a
+  degraded ADC clock and JESD-block registers (jesd_analog page, jesd_digital 0x000) read back 0.
+- **TI's EVM GUI configs** in `configs/evmgui/Configuration Files/` (`ADS54J40_LMF_4244.cfg` etc.) are the
+  best reference for tested ADC write sequences, including "always write 1" bits the datasheet tables
+  hide (jesd_digital 0x016 = 0x80, jesd_analog 0x012 = 0x02, offset_read 0x068 = 0x02).
 
 ## Current clock plan (`LMKConfig.txt`)
 
@@ -86,9 +92,8 @@ and `R0 = 0x00` (back to 3-wire). Run `lmk_checkconfig.py` to see it decoded.
   does). Every JESD-bank access writes 4-005h = 01 (per-channel, broadcast off) plus the page selects.
   JESD link: **LMFS 4244** (L=4, M=2, F=4, S=4, N'=16), 8.0 Gbps/lane at 800 MSPS, FPGA core clock
   200 MHz (lane rate/40), scrambling off (ADC default). JESD MODE = 010 (0x02), PLL MODE 40X. The
-  datasheet contradicts itself (Table 8-14: 4211 = 100, 4244 = 010; Table 8-17 example labels 0x02 as
-  4211). Table 8-14's pattern (010 = half lanes, double F) supports 010 = 4244. Confirm with the ILA
-  that the FPGA's JESD core receives.
+  datasheet's Table 8-17 example wrongly labels 0x02 as 4211. TI's GUI files confirm 4244 = 0x02 and
+  4211 = 0x04, matching Table 8-14.
 - **Active lanes for 4244/4211: DA1, DA2, DB1, DB2 = FMC DP4, DP6, DP0, DP2** (EVM sheet 6, VITA 57.1
   pins). They span DP0–DP7, so on carriers that put DP0–3 and DP4–7 on separate GT quads the link needs
   two quads. Full map: DB1 DP0, DB3 DP1, DB2 DP2, DB0 DP3, DA1 DP4, DA3 DP5, DA2 DP6, DA0 DP7.
