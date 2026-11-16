@@ -1,91 +1,119 @@
 #!/usr/bin/env python3
+"""
+Initialize the ADS54J40 and configure its JESD204B link.
+
+Runs the datasheet reset sequence (Table 9-1) and then programs both
+channels for LMFS = 4211 (two lanes per ADC, 40X SERDES PLL, no
+decimation). Every written register is read back.
+
+Usage:
+
+    ./ads_flash.py [-v]
+"""
+
+import argparse
 import sys
-from pathlib import Path
 
 from ti_adcevm.ads54j40 import ADS54J40
 
-# ---------------- target config (adjust as needed) ----------------
-SAMPLE_MSPS = 800          # ADC sampling rate
-LMFS        = "8224"       # L=4/dev (2/ADC), M=2, F=1, S=1
-K_FRAMES    = 8           # frames per multiframe  ->  written as K-1 = 0x0F
-SUBCLASS    = 1            # 1 = subclass 1 (SYSREF sync)
-PDN_UNUSED_LANES = True    # tri-state DA0/DA3/DB0/DB3 in LMFS=4211
-
-K_REG     = K_FRAMES - 1
-SUBC_REG  = SUBCLASS << 3
-# LMFS=4211 (from Table 8-17): JESD_MODE=010, JESD_FILTER=000 --> 0x02
-JESD_MAIN_DIG_REG   = 0x02
-JESD_PLL_40X_REG    = 0x02
+# ---------------- target configuration ----------------
+SAMPLE_MSPS = 800           # ADC sampling rate (informational only)
+LMFS = "4211"               # L=4 lanes/device (2 per ADC), M=2, F=1, S=1
+K_FRAMES = 8                # frames per multiframe, register holds K-1
+SUBCLASS = 1                # 1 = subclass 1 (deterministic latency via SYSREF)
+PDN_UNUSED_LANES = True     # tri-state DA0/DA3/DB0/DB3, unused with LMFS=4211
 
 CHANNELS = (0, 1)
 
-def banner(t):
-    print("\n" + "=" * 70); print(t); print("=" * 70)
+# JESD digital page (6900h)
+CTRL_K = 0x80                       # 0x000 bit 7: use K from register 0x006
+K_REG = K_FRAMES - 1                # 0x006
+JESD_MODE_FILTER = 0x02             # 0x001: JESD FILTER = 000, JESD MODE = 010
+SUBCLASS_REG = SUBCLASS << 3        # 0x007 bit 3
 
-results = []
+# JESD analog page (6A00h)
+JESD_PLL_MODE_40X = 0x02            # 0x016: 40X mode, two lanes per ADC
+PLL_RESET = 0x40                    # 0x017 bit 6
+LANE_PDN = 0x28                     # 0x017 bits 5 and 3 (LANE PDN 1 + 0)
 
-def set_verify(ch, page, addr, desc, value):
-    adc.write_register(page, addr, value, channel=ch)
-    rb = adc.read_register(page, addr, channel=ch)
-    ok = (rb == value)
-    results.append(ok)
-    status = "[PASS]" if ok else "[FAIL]"
-    print(f"  CH{ch} {page} 0x{addr:03X} ({desc:28s}) write=0x{value:02X} read=0x{rb:02X} {status}")
+
+def banner(title):
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+
+
+def write_verify(adc, channel, page, address, value, description):
+    """Write a register, read it back, print the result and return True on match."""
+
+    adc.write_register(page, address, value, channel=channel)
+    readback = adc.read_register(page, address, channel=channel)
+    ok = readback == value
+
+    print(
+        f"  CH{channel} {page:12s} 0x{address:03X} ({description:20s}) "
+        f"write=0x{value:02X} read=0x{readback:02X} {'[PASS]' if ok else '[FAIL]'}"
+    )
     return ok
 
 
-with ADS54J40(verbose=False) as adc:
+def configure(adc):
+    """Program the JESD link on both channels. Returns a list of pass/fail results."""
 
-    banner(f"Configuring JESD204B link: {SAMPLE_MSPS} MSa, LMFS={LMFS}, K={K_FRAMES}, subclass {SUBCLASS}")
-    print(f"  (K reg = {K_REG:#04x}, SUBCLASS reg = {SUBC_REG:#04x})\n")
+    results = []
+    lane_pdn = LANE_PDN if PDN_UNUSED_LANES else 0x00
 
     for ch in CHANNELS:
         print(f"--- Channel {ch} ---")
 
-        # 1. CTRL K = 1 (bit7 of 0x000) so 0x006 K value takes effect
-        set_verify(ch, "jesd_digital", 0x000, "CTRL K enable",       0x80)
-        # 2. K value (frames per multiframe)
-        set_verify(ch, "jesd_digital", 0x006, "frames/multiframe K", K_REG)
-        # 3. JESD MODE/FILTER -> 40X, 2 lanes
-        set_verify(ch, "jesd_digital", 0x001, "JESD MODE/FILTER",    JESD_MAIN_DIG_REG)
-        # 4. Subclass
-        set_verify(ch, "jesd_digital", 0x007, "SUBCLASS",            SUBC_REG)
-        # 5. JESD PLL MODE 40X
-        set_verify(ch, "jesd_analog",  0x016, "JESD PLL MODE",       JESD_PLL_40X_REG)
+        results += [
+            write_verify(adc, ch, "jesd_digital", 0x000, CTRL_K, "CTRL K enable"),
+            write_verify(adc, ch, "jesd_digital", 0x006, K_REG, "frames/multiframe K"),
+            write_verify(adc, ch, "jesd_digital", 0x001, JESD_MODE_FILTER, "JESD MODE/FILTER"),
+            write_verify(adc, ch, "jesd_digital", 0x007, SUBCLASS_REG, "SUBCLASS"),
+            write_verify(adc, ch, "jesd_analog", 0x016, JESD_PLL_MODE_40X, "JESD PLL MODE"),
+        ]
 
-    # 6. PLL reset pulse (Table 9-1 step 4), per channel
-    print("\n--- PLL reset pulse ---")
-    for ch in CHANNELS:
-        adc.write_register("jesd_analog", 0x017, 0x40, channel=ch)
-        adc.write_register("jesd_analog", 0x017, 0x00, channel=ch)
-        print(f"  CH{ch} PLL reset pulsed (0x017: 0x40 -> 0x00)")
+        # Pulse PLL RESET (Table 9-1 step 4), keeping the lane power-down bits.
+        adc.write_register("jesd_analog", 0x017, lane_pdn | PLL_RESET, channel=ch)
+        results.append(
+            write_verify(adc, ch, "jesd_analog", 0x017, lane_pdn, "PLL reset/LANE PDN")
+        )
 
-    # 7. Optional: power down unused lanes (LANE PDN 1+0 = 0x28) for LMFS=4211
-    if PDN_UNUSED_LANES:
-        print("\n--- Lane power-down (unused lanes DA0/DA3/DB0/DB3) ---")
-        for ch in CHANNELS:
-            adc.write_register("jesd_analog", 0x017, 0x28, channel=ch)
-            rb = adc.read_register("jesd_analog", 0x017, channel=ch)
-            ok = (rb == 0x28)
-            results.append(ok)
-            print(f"  CH{ch} LANE PDN 0x017 = 0x{rb:02X} {'[PASS]' if ok else '[FAIL]'}")
+    return results
 
-    # ---------------- final full read-back dump ----------------
-    banner("Final read-back verification")
-    for ch in CHANNELS:
-        print(f"--- Channel {ch} ---")
-        for page, addr, desc in [
-            ("jesd_digital", 0x000, "CTRL K"),
-            ("jesd_digital", 0x006, "K"),
-            ("jesd_digital", 0x001, "JESD MODE/FILTER"),
-            ("jesd_digital", 0x007, "SUBCLASS"),
-            ("jesd_analog",  0x016, "PLL MODE"),
-            ("jesd_analog",  0x017, "LANE PDN/PLL rst"),
-        ]:
-            v = adc.read_register(page, addr, channel=ch)
-            print(f"  CH{ch} {page} 0x{addr:03X} = 0x{v:02X}")
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="log SPI frames")
+    args = parser.parse_args()
+
+    try:
+        with ADS54J40(verbose=args.verbose) as adc:
+            banner("ADS54J40 initialization (datasheet Table 9-1)")
+            adc.initialize()
+
+            banner(
+                f"JESD204B link: {SAMPLE_MSPS} MSPS, LMFS={LMFS}, "
+                f"K={K_FRAMES}, subclass {SUBCLASS}"
+            )
+            results = configure(adc)
+
+    except (ValueError, RuntimeError, OSError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
 
     banner("RESULT")
     passed = sum(results)
     print(f"  {passed}/{len(results)} checks passed")
-    print("   ALL CHECKS PASSED" if passed == len(results) else "   SOME CHECKS FAILED")
+
+    if passed != len(results):
+        print("  SOME CHECKS FAILED")
+        return 1
+
+    print("  ALL CHECKS PASSED")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,64 +1,48 @@
 #!/usr/bin/env python3
+"""
+Annotate a TICS Pro LMK04828 register export with decoded address/value.
+
+    R0 (INIT)   0x000090   ->   R0 (INIT)   0x000090  -> R0x000 => 0x90 = 0b10010000
+
+Usage:
+
+    ./translateticsfile.py configs/LMKConfig.txt annotated.txt
+"""
 
 import argparse
 import re
 
-
-TICS_PATTERN = re.compile(
-    r"^(\s*R\d+(?:\s*\([^)]*\))?\s+)(0x[0-9A-Fa-f]+)"
-)
+# "R<n> [(text)] 0x<24-bit word>", word = address << 8 | value
+TICS_LINE = re.compile(r"^\s*R\d+(?:\s*\([^)]*\))?\s+(0x[0-9A-Fa-f]+)")
 
 
 def annotate_file(input_file, output_file):
-
-    with open(input_file, "r", encoding="utf-8") as infile, \
+    with open(input_file, encoding="utf-8") as infile, \
          open(output_file, "w", encoding="utf-8") as outfile:
 
         for line in infile:
-
-            match = TICS_PATTERN.match(line)
+            match = TICS_LINE.match(line)
 
             if match is None:
-                # Keep headers, blank lines, comments, etc.
+                # Keep headers, blank lines, comments, etc. unchanged.
                 outfile.write(line)
                 continue
 
-            prefix = match.group(1)
-            word_string = match.group(2)
+            word = int(match.group(1), 16)
+            address, value = word >> 8, word & 0xFF
 
-            word = int(word_string, 16)
-
-            # TICS Pro encoding:
-            # bits 23:8 = register address
-            # bits 7:0  = register value
-            address = (word >> 8) & 0x1FFF
-            value = word & 0xFF
-
-            # Preserve the original spacing/text before the hex word
-            original = line.rstrip()
-
-            annotated = (
-                f"{original}"
-                f"  -> R0x{address:03X} => 0x{value:02X}"
-                f" = 0b{value:08b}\n"
+            outfile.write(
+                f"{line.rstrip()}  -> R0x{address:03X} => 0x{value:02X} = 0b{value:08b}\n"
             )
-
-            outfile.write(annotated)
 
 
 def main():
-
-    parser = argparse.ArgumentParser(
-        description="Annotate TICS Pro LMK04828 configuration files."
-    )
-
-    parser.add_argument("input")
-    parser.add_argument("output")
-
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument("input", help="TICS Pro register export")
+    parser.add_argument("output", help="annotated output file")
     args = parser.parse_args()
 
     annotate_file(args.input, args.output)
-
     print(f"Wrote {args.output}")
 
 

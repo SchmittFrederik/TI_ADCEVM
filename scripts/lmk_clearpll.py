@@ -1,73 +1,67 @@
 #!/usr/bin/env python3
+"""
+Clear the LMK04828 PLL lock-lost flags and report whether they stay clear.
+
+Usage:
+
+    ./lmk_clearpll.py [--mode 4wire] [--wait 1.0]
+"""
+
+import argparse
+import sys
+import time
 
 from ti_adcevm.lmk04828 import LMK04828
-from time import sleep
-
-def check_pll(lmk):
-    r182 = lmk.read_register(0x182)
-    r183 = lmk.read_register(0x183)
-
-    # PLL status
-    pll1_locked = bool(r182 & 0x02)
-    pll1_lost   = bool(r182 & 0x04)
-
-    pll2_locked = bool(r183 & 0x02)
-    pll2_lost   = bool(r183 & 0x04)
-
-    return pll1_locked, pll1_lost, pll2_locked, pll2_lost
 
 
-def clear_pll(lmk):
-    # Clear PLL1 lock-lost flag
-    lmk.write_register(0x182, 0x01)
-    lmk.write_register(0x182, 0x00)
-
-    # Clear PLL2 lock-lost flag
-    lmk.write_register(0x183, 0x01)
-    lmk.write_register(0x183, 0x00)
-
-
-def print_pll_status(label, status):
-    pll1_locked, pll1_lost, pll2_locked, pll2_lost = status
-
-    def state(value):
-        return "YES" if value else "NO"
+def print_pll_status(label, s):
+    def yes_no(flag):
+        return "YES" if flag else "NO"
 
     print(f"{label}:")
-    print(f"  PLL1: Locked = {state(pll1_locked):3s} | Lock lost = {state(pll1_lost)}")
-    print(f"  PLL2: Locked = {state(pll2_locked):3s} | Lock lost = {state(pll2_lost)}")
+    print(f"  PLL1: Locked = {yes_no(s['pll1_locked']):3s} | Lock lost = {yes_no(s['pll1_lock_lost'])}")
+    print(f"  PLL2: Locked = {yes_no(s['pll2_locked']):3s} | Lock lost = {yes_no(s['pll2_lock_lost'])}")
 
 
 def main():
-    lmk = LMK04828()
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument(
+        "--mode", choices=("3wire", "4wire"), default="3wire",
+        help="readback mode the LMK is currently in (default 3wire)",
+    )
+    parser.add_argument(
+        "--wait", type=float, default=1.0,
+        help="seconds to wait after clearing before re-reading (default 1.0)",
+    )
+    args = parser.parse_args()
 
-    print("LMK04828 PLL Status")
-    print("=" * 40)
+    try:
+        with LMK04828(initial_mode=args.mode) as lmk:
+            print("LMK04828 PLL Status")
+            print("=" * 40)
 
-    # Read initial status
-    pre = check_pll(lmk)
-    print_pll_status("Before clearing", pre)
+            print_pll_status("Before clearing", lmk.read_status())
+            lmk.clear_pll_lock_lost()
+            time.sleep(args.wait)
+            post = lmk.read_status()
+            print()
+            print_pll_status("After clearing", post)
 
-    # Clear lock-lost flags
-    clear_pll(lmk)
+    except (ValueError, RuntimeError, OSError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
 
-    # pause 1s 
-    sleep(1)
-
-    # Read status again
-    post = check_pll(lmk)
     print()
-    print_pll_status("After clearing", post)
-
-    # Evaluate result
-    print()
-    if not post[0] or not post[2]:
+    if not (post["pll1_locked"] and post["pll2_locked"]):
         print("ERROR: At least one PLL is not locked.")
-    elif post[1] or post[3]:
+        return 1
+    if post["pll1_lock_lost"] or post["pll2_lock_lost"]:
         print("WARNING: At least one lock-lost flag remains set.")
-    else:
-        print("SUCCESS: Both PLLs are locked and their lock-lost flags are clear.")
+        return 1
+
+    print("SUCCESS: Both PLLs are locked and their lock-lost flags are clear.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Flash a TICS Pro LMK04828 register configuration.
+Write a TICS Pro (or EVM GUI) LMK04828 register configuration.
 
 Usage:
 
-    ./flash_lmk.py LMKConfig800.txt
+    ./lmk_flash.py configs/LMKConfig.txt
+    ./lmk_flash.py configs/LMKConfig.txt --verify
 
-Optional verification:
-
-    ./flash_lmk.py LMKConfig800.txt --verify
-
-The script keeps one FTDI connection open for the complete
-configuration and automatically follows the LMK 3-wire/4-wire
-transition caused by R0[4].
+One FTDI connection is kept open for the whole file, and the driver
+follows the 3-wire/4-wire switch caused by writes to R0. With --verify,
+all registers are read back after the last write.
 """
 
 import argparse
@@ -20,35 +17,24 @@ import sys
 
 from ti_adcevm.lmk04828 import LMK04828
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Flash a TICS Pro LMK04828 configuration."
-    )
-
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument("config", help="register configuration file")
     parser.add_argument(
-        "config",
-        help="TICS Pro configuration file",
+        "--mode", choices=("3wire", "4wire"), default="3wire",
+        help="readback mode the LMK is currently in (default 3wire)",
     )
-
-    parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="Read every register back after writing.",
-    )
-
+    parser.add_argument("--verify", action="store_true", help="read every register back")
     args = parser.parse_args()
 
     try:
-        with LMK04828() as lmk:
-
+        with LMK04828(initial_mode=args.mode) as lmk:
             print(f"Configuration: {args.config}")
             print(f"Initial SPI mode: {lmk.spi_mode}")
             print()
 
-            lmk.load_config(
-                args.config,
-                verify=args.verify,
-            )
+            lmk.load_config(args.config, verify=args.verify)
 
             print()
             print(f"Final SPI mode: {lmk.spi_mode}")

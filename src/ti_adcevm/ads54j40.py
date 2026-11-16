@@ -1,1410 +1,407 @@
-#!/usr/bin/env python3
+"""
+Bit-banged SPI driver for the TI ADS54J40 on the ADS54J40EVM.
 
-from ti_adcevm.ftdi_gpio import ADSGpioSyncController
+SPI frame (datasheet section 8.4.2, Figure 8-12), 24 clocks, MSB first:
+
+    bit 15      R/W   0 = write, 1 = read
+    bit 14      M     0 = analog bank, 1 = JESD bank
+    bit 13      P     JESD bank only: 0 = page-select access, 1 = register access
+    bit 12      CH    JESD bank only: 0 = channel A, 1 = channel B
+    bits 11:0   register address
+    bits 7:0    data (write) / don't care (read, data appears on SDOUT)
+
+SDIN is latched on the rising SCLK edge; SDOUT changes on the falling edge.
+
+The register space is paged (datasheet Figure 8-27). Callers only name a
+page and an address; this driver writes the page-select registers in the
+same SEN-low cycle before the actual access. Example:
+
+    with ADS54J40() as adc:
+        value = adc.read_register("analog_master", 0x59)
+        adc.write_register("jesd_analog", 0x16, 0x02, channel=1)
+"""
+
+from dataclasses import dataclass
+
+from ti_adcevm.ftdi_gpio import (
+    ADC_SDO,
+    ADC_SEN,
+    DEFAULT_URL,
+    LMK_CS,
+    SCK,
+    SDIO,
+    ADSGpioSyncController,
+)
+
+
+@dataclass(frozen=True)
+class Page:
+    """One user-visible register page."""
+
+    m: int                 # M bit: 0 = analog bank, 1 = JESD bank
+    p: int                 # P bit used for the register access itself
+    addresses: range       # valid register addresses on this page
+    analog_page: int | None = None      # value for 0-011h (analog bank)
+    jesd_page: int | None = None        # value for 4-003h/4-004h
+    jesd_page1: int = 0x0000            # value for 4-001h/4-002h
 
 
 class ADS54J40:
-    """
-    Bit-banged SPI driver for the ADS54J40EVM.
+    """Register-level interface to the ADS54J40 via the EVM's FT245."""
 
-    FT245 GPIO mapping:
-
-        D0 -> SCLK
-        D1 -> SDIO
-        D2 <- SDO
-        D3 -> SEN
-
-
-    ADS54J40 SPI header:
-
-        bit 15      R/W
-        bit 14      M
-        bit 13      P
-        bit 12      CH
-        bits 11:0  address
-
-
-    Write:
-
-        [R/W M P CH A11...A0] [D7...D0]
-
-        16-bit header + 8-bit data = 24 clocks
-
-
-    Read:
-
-        [R/W M P CH A11...A0] [SDO D7...D0]
-
-        16 command clocks + 8 read clocks
-
-
-    User-facing register pages:
-
-        analog_general
-        analog_page_select
-        analog_master
-        analog_adc
-
-        jesd_general
-        jesd_page_select
-        jesd_page_select1
-
-        jesd_main
-        jesd_digital
-        jesd_analog
-
-        offset_page_select
-        offset_read
-        offset_load
-
-
-    Example:
-
-        with ADS54J40() as adc:
-
-            value = adc.read_register(
-                "analog_master",
-                0x20,
-            )
-
-            adc.write_register(
-                "jesd_analog",
-                0x16,
-                0x02,
-            )
-
-
-    The class intentionally keeps the low-level SPI interface generic.
-    ADS54J40-specific M/P/page-selection logic is handled here, so
-    application code does not need to know about it.
-    """
-
-    # ==================================================================
-    # FT245 GPIO pins
-    # ==================================================================
-
-    SCK = 0x01       # D0 -> SCLK
-    SDIO = 0x02      # D1 -> SDIO
-    SDO = 0x04       # D2 <- SDO
-    SEN = 0x08       # D3 -> SEN
-
-    OUTPUT_PINS = SCK | SDIO | SEN
-
-    # SPI clock half-period in seconds.
-    #
-    # 5 ms half-period -> approximately 100 Hz SCLK.
-    #
-    # Deliberately slow during initial bring-up and well below the
-    # ADS54J40 SPI maximum of 2 MHz.
-    HALF_PERIOD = 500e-9
-    # ==================================================================
-    # ADS54J40 register/page structure
-    # ==================================================================
-
+    # Registers that are not behind a page select are exposed as the
+    # "analog_general" (0-000h, 0-011h) and "jesd_general" (4-001h..4-005h)
+    # pages, mainly for debugging.
     PAGES = {
-
-        # --------------------------------------------------------------
-        # Analog Bank, M=0, P=0
-        # --------------------------------------------------------------
-
-        "analog_general": {
-            "bank": 0,
-            "page_access": 0,
-            "selector": None,
-            "address_min": 0x000,
-            "address_max": 0x000,
-        },
-
-        "analog_page_select": {
-            "bank": 0,
-            "page_access": 0,
-            "selector": None,
-            "address_min": 0x011,
-            "address_max": 0x011,
-        },
-
-        "analog_master": {
-            "bank": 0,
-            "page_access": 0,
-            "selector": ("analog", 0x80),
-            "address_min": 0x020,
-            "address_max": 0x059,
-        },
-
-        "analog_adc": {
-            "bank": 0,
-            "page_access": 0,
-            "selector": ("analog", 0x0F),
-            "address_min": 0x05F,
-            "address_max": 0x05F,
-        },
-
-        # --------------------------------------------------------------
-        # JESD Bank, M=1, P=0
-        # --------------------------------------------------------------
-
-        "jesd_general": {
-            "bank": 1,
-            "page_access": 0,
-            "selector": None,
-            "address_min": 0x005,
-            "address_max": 0x005,
-        },
-
-        "jesd_page_select": {
-            "bank": 1,
-            "page_access": 0,
-            "selector": None,
-            "address_min": 0x003,
-            "address_max": 0x004,
-        },
-
-        "jesd_page_select1": {
-            "bank": 1,
-            "page_access": 0,
-            "selector": None,
-            "address_min": 0x001,
-            "address_max": 0x002,
-        },
-
-        # --------------------------------------------------------------
-        # JESD pages, M=1, P=1
-        # --------------------------------------------------------------
-
-        "jesd_main": {
-            "bank": 1,
-            "page_access": 1,
-            "selector": ("jesd", 0x6800),
-            "address_min": 0x000,
-            "address_max": 0x0F7,
-        },
-
-        "jesd_digital": {
-            "bank": 1,
-            "page_access": 1,
-            "selector": ("jesd", 0x6900),
-            "address_min": 0x000,
-            "address_max": 0x032,
-        },
-
-        "jesd_analog": {
-            "bank": 1,
-            "page_access": 1,
-            "selector": ("jesd", 0x6A00),
-            "address_min": 0x012,
-            "address_max": 0x01B,
-        },
-
-        # --------------------------------------------------------------
-        # Offset pages
-        # --------------------------------------------------------------
-
-        "offset_page_select": {
-            "bank": 1,
-            "page_access": 0,
-            "selector": None,
-            "address_min": 0x001,
-            "address_max": 0x002,
-        },
-
-        "offset_read": {
-            "bank": 1,
-            "page_access": 1,
-            "selector": ("offset", 0x0000),
-            "address_min": 0x068,
-            "address_max": 0x07B,
-        },
-
-        "offset_load": {
-            "bank": 1,
-            "page_access": 1,
-            "selector": ("offset", 0x0500),
-            "address_min": 0x000,
-            "address_max": 0x00D,
-        },
+        "analog_general": Page(m=0, p=0, addresses=range(0x000, 0x012)),
+        "analog_master":  Page(m=0, p=0, addresses=range(0x020, 0x05A), analog_page=0x80),
+        "analog_adc":     Page(m=0, p=0, addresses=range(0x05F, 0x060), analog_page=0x0F),
+        "jesd_general":   Page(m=1, p=0, addresses=range(0x001, 0x006)),
+        "jesd_main":      Page(m=1, p=1, addresses=range(0x000, 0x0F8), jesd_page=0x6800),
+        "jesd_digital":   Page(m=1, p=1, addresses=range(0x000, 0x033), jesd_page=0x6900),
+        "jesd_analog":    Page(m=1, p=1, addresses=range(0x012, 0x01C), jesd_page=0x6A00),
+        "offset_read":    Page(m=1, p=1, addresses=range(0x068, 0x07C), jesd_page=0x6100, jesd_page1=0x0000),
+        "offset_load":    Page(m=1, p=1, addresses=range(0x000, 0x079), jesd_page=0x6100, jesd_page1=0x0500),
     }
 
-    # ==================================================================
-    # Initialization
-    # ==================================================================
+    # General registers
+    REG_RESET = 0x000           # analog bank, bits 7 and 0: software reset
+    REG_ANALOG_PAGE = 0x011     # analog bank page select
+    REG_JESD_PAGE1_LO = 0x001   # JESD bank, JESD BANK PAGE SEL1[7:0]
+    REG_JESD_PAGE1_HI = 0x002   # JESD bank, JESD BANK PAGE SEL1[15:8]
+    REG_JESD_PAGE_LO = 0x003    # JESD bank, JESD BANK PAGE SEL[7:0]
+    REG_JESD_PAGE_HI = 0x004    # JESD bank, JESD BANK PAGE SEL[15:8]
+    REG_BROADCAST = 0x005       # JESD bank, bit 0: DISABLE BROADCAST
 
-    def __init__(
-        self,
-        url="ftdi://ftdi:232r/1",
-        *,
-        half_period=None,
-        verbose=True,
-    ):
+    # Pins this driver drives. LMK CS is driven high so the LMK04828,
+    # which shares SCK/SDIO, ignores ADC traffic.
+    OUTPUT_PINS = SCK | SDIO | ADC_SEN | LMK_CS
+    IDLE = ADC_SEN | LMK_CS     # SEN high, LMK deselected, SCLK low
+
+    # Duration of one GPIO sample. One SCLK period takes two samples,
+    # so 500 ns gives ~1 MHz SCLK (datasheet max 2 MHz, setup/hold 100 ns).
+    HALF_PERIOD = 500e-9
+
+    def __init__(self, url=DEFAULT_URL, *, half_period=HALF_PERIOD, verbose=0):
         """
-        Initialize the FT232R synchronous GPIO interface.
+        Open the FTDI interface. Does not touch the ADC.
+
+        Call initialize() once after power-up (datasheet Table 9-1)
+        before configuring the device.
+
+        verbose: 0 = quiet, 1 = log every SPI frame,
+                 2 = additionally dump every sampled SDOUT bit.
         """
 
-        self.url = url
-        self.verbose = verbose
-
-        if half_period is None:
-            self.half_period = self.HALF_PERIOD
-        else:
-            self.half_period = half_period
-
-        if self.half_period <= 0:
+        if half_period <= 0:
             raise ValueError("half_period must be positive")
 
-        # GpioSyncController outputs one GPIO sample per configured
-        # frequency period. Two samples are used for each SPI clock
-        # cycle: one with SCK low and one with SCK high.
-        self.gpio_frequency = 1.0 / self.half_period
-
+        self.verbose = verbose
         self.gpio = ADSGpioSyncController()
         self.gpio.configure(
-            self.url,
+            url,
             direction=self.OUTPUT_PINS,
-            frequency=self.gpio_frequency,
-            initial=self.SEN,
+            frequency=1.0 / half_period,
+            initial=self.IDLE,
         )
-    # ==================================================================
-    # GPIO
-    # ==================================================================
-    def _exchange(self, outputs):
-        """Output a GPIO waveform and return the sampled GPIO inputs."""
 
-        if not outputs:
-            return b""
+    # ==================================================================
+    # Waveform level
+    # ==================================================================
+    #
+    # In FTDI synchronous bit-bang mode, every output byte produces one
+    # input byte, and that input byte is the pin state sampled just
+    # *before* the output byte is applied. inputs[k] therefore shows the
+    # pins as set by outputs[k - 1].
+
+    def _exchange(self, outputs):
+        """Clock out a GPIO waveform and return the sampled inputs."""
 
         outputs = bytes(outputs)
         inputs = self.gpio.exchange(outputs)
 
         if len(inputs) != len(outputs):
             raise RuntimeError(
-                f"FTDI exchange length mismatch: "
-                f"sent {len(outputs)} bytes, received {len(inputs)} bytes"
+                f"FTDI exchange length mismatch: sent {len(outputs)} bytes, "
+                f"received {len(inputs)} bytes"
             )
-
         return inputs
 
-    def _write_gpio(self, value):
-        """
-        Write one GPIO state.
+    def _begin(self):
+        """Pull SEN low and wait a few samples (tSLOADS >= 100 ns)."""
 
-        Kept for compatibility with the existing driver.
-        """
+        self._exchange([LMK_CS] * 3)
 
-        self._exchange(bytes([value]))
+    def _end(self):
+        """Hold SCLK low for a couple of samples (tSLOADH), then release SEN."""
 
-    # ==================================================================
-    # SPI clocking
-    # ==================================================================
-
-    def _clock_out_bit(self, bit):
-        """
-        Output one SDIO bit.
-
-        ADS54J40 samples SDIO on the rising edge of SCLK.
-        """
-
-        value = self.SDIO if bit else 0
-
-        self._exchange(
-            bytes([
-                value,
-                value | self.SCK,
-            ])
-        )
-
-    def _clock_in_bit(self):
-        """
-        Read one SDO bit.
-
-        ADS54J40 updates SDO on the falling edge.
-        The host samples SDO on the following rising edge.
-        """
-
-        inputs = self._exchange(
-            bytes([
-                0,
-                self.SCK,
-            ])
-        )
-
-        # The second sample corresponds to the rising edge.
-        return 1 if (inputs[1] & self.SDO) else 0
-
-    # ==================================================================
-    # Bit-level transfers
-    # ==================================================================
+        self._exchange([LMK_CS, LMK_CS, self.IDLE])
 
     def _send_bits(self, value, nbits):
         """
-        Send nbits MSB first using one synchronous FTDI transfer.
+        Shift out nbits of value, MSB first, and end with SCLK low.
 
-        For each SPI bit:
-
-            state 0: SCLK low, SDIO valid
-            state 1: SCLK high, SDIO valid
-
-        The FTDI hardware generates the timing between states.
+        Each bit is two samples: SCLK low with data valid, then SCLK high
+        (the ADC latches SDIN on this rising edge).
         """
 
-        outputs = bytearray(2 * nbits)
-
-        pos = 0
-
-        for bit_index in range(nbits - 1, -1, -1):
-            bit = (value >> bit_index) & 1
-            data = self.SDIO if bit else 0
-
-            # SCLK low, data already valid.
-            outputs[pos] = data
-
-            # Rising edge.
-            outputs[pos + 1] = data | self.SCK
-
-            pos += 2
-
-        # Return to SCLK low.
-        outputs.append(0)
+        outputs = bytearray()
+        for i in range(nbits - 1, -1, -1):
+            data = LMK_CS | (SDIO if (value >> i) & 1 else 0)
+            outputs += bytes([data, data | SCK])
+        outputs.append(LMK_CS)
 
         self._exchange(outputs)
 
     def _read_bits(self, nbits):
         """
-        Read nbits MSB first.
+        Clock in nbits from SDOUT, MSB first.
 
-        ADS54J40 SDOUT changes on the SCLK falling edge,
-        so sample after the falling edge.
+        The ADC updates SDOUT on each falling SCLK edge (the first bit
+        after the falling edge that ends the header), so it is stable
+        while SCLK is high. Bit i is in inputs[2*i + 1], which is the pin
+        state while SCLK is high during clock i.
         """
 
-        outputs = bytearray()
-
-        for _ in range(nbits):
-            # Rising edge
-            outputs.append(self.SCK)
-
-            # Falling edge
-            outputs.append(0)
-
+        outputs = bytes([LMK_CS | SCK, LMK_CS] * nbits)
         inputs = self._exchange(outputs)
 
         value = 0
-
-        if getattr(self, "verbose", False):
-            print("SDO samples:")
-
-        for bit_index in range(nbits):
-            # Sample corresponding to the low-SCLK state after
-            # the falling edge.
-            sample = inputs[2 * bit_index + 1]
-
-            bit = 1 if (sample & self.SDO) else 0
-
-            if getattr(self, "verbose", False):
-                print(
-                    f"  bit {nbits - 1 - bit_index}: "
-                    f"FTDI input=0x{sample:02X} "
-                    f"SDO={'HIGH' if bit else 'LOW'}"
-                )
-
+        for i in range(nbits):
+            sample = inputs[2 * i + 1]
+            bit = 1 if sample & ADC_SDO else 0
             value = (value << 1) | bit
 
-        if getattr(self, "verbose", False):
-            print(f"  reconstructed value = 0x{value:02X}")
-
-        return value    
-    # ==================================================================
-    # SEN control
-    # ==================================================================
-
-    def _begin(self):
-        """
-        Assert SEN.
-
-        Result:
-            SEN = 0
-            SCK = 0
-            SDIO = 0
-
-        Holds SEN low for a couple of quiet samples before the first
-        SCLK edge (tSLOADS >= 100 ns).
-        """
-        self._exchange(bytes([0, 0, 0]))
-
-    def _end(self):
-        """
-        Finish SPI transaction and deassert SEN.
-
-        Returns to SCLK low, holds it quiet, then deasserts SEN
-        (tSLOADH >= 100 ns).
-        """
-        self._exchange(bytes([0, 0, self.SEN]))    
-    # ==================================================================
-    # SPI header
-    # ==================================================================
-
-    @staticmethod
-    def _make_header(
-        read,
-        bank,
-        page_access,
-        channel,
-        address,
-    ):
-        """
-        Construct the 16-bit ADS54J40 SPI header.
-
-        bit 15      R/W
-        bit 14      M
-        bit 13      P
-        bit 12      CH
-        bits 11:0  address
-        """
-
-        if not 0 <= address <= 0xFFF:
-            raise ValueError(
-                f"Address must be 12-bit, got 0x{address:X}"
-            )
-
-        if read not in (0, 1):
-            raise ValueError("read must be 0 or 1")
-
-        if bank not in (0, 1):
-            raise ValueError("bank must be 0 or 1")
-
-        if page_access not in (0, 1):
-            raise ValueError("page_access must be 0 or 1")
-
-        if channel not in (0, 1):
-            raise ValueError("channel must be 0 or 1")
-
-        return (
-            (read << 15)
-            | (bank << 14)
-            | (page_access << 13)
-            | (channel << 12)
-            | address
-        )
-
-    # ==================================================================
-    # Low-level SPI transactions
-    # ==================================================================
-
-    def raw_write(
-        self,
-        address,
-        value,
-        *,
-        bank=0,
-        page_access=0,
-        channel=0,
-    ):
-        """
-        Perform one complete 24-bit SPI write.
-
-        SEN is asserted for the complete transaction:
-
-            SEN low
-            16-bit header
-            8-bit data
-            SEN high
-        """
-
-        if not 0 <= value <= 0xFF:
-            raise ValueError(
-                f"Value must be 8-bit, got 0x{value:X}"
-            )
-
-        header = self._make_header(
-            read=0,
-            bank=bank,
-            page_access=page_access,
-            channel=channel,
-            address=address,
-        )
-
-        word = (header << 8) | value
-
-        if self.verbose:
-            print(
-                f"WRITE: "
-                f"R/W=0 "
-                f"M={bank} "
-                f"P={page_access} "
-                f"CH={channel} "
-                f"ADDR=0x{address:03X} "
-                f"DATA=0x{value:02X} "
-                f"WORD=0x{word:06X}"
-            )
-
-        self._begin()
-
-        try:
-            self._send_bits(word, 24)
-        finally:
-            self._end()
-
-    def raw_read(
-        self,
-        address,
-        *,
-        bank=0,
-        page_access=0,
-        channel=0,
-    ):
-        """
-        Perform one complete ADS54J40 SPI read.
-
-        Sends:
-
-            16-bit read header
-
-        followed by:
-
-            8 read clocks.
-
-        SEN remains low for the entire transaction.
-        """
-
-        header = self._make_header(
-            read=1,
-            bank=bank,
-            page_access=page_access,
-            channel=channel,
-            address=address,
-        )
-
-        if self.verbose:
-            print(
-                f"READ:  "
-                f"R/W=1 "
-                f"M={bank} "
-                f"P={page_access} "
-                f"CH={channel} "
-                f"ADDR=0x{address:03X} "
-                f"HEADER=0x{header:04X}"
-            )
-
-        self._begin()
-
-        try:
-            self._send_bits(header, 16)
-
-            value = self._read_bits(8)
-        finally:
-            self._end()
-
-        if self.verbose:
-            print(
-                f"       DATA=0x{value:02X}"
-            )
+            if self.verbose >= 2:
+                print(
+                    f"  SDO bit {nbits - 1 - i}: "
+                    f"pins=0x{sample:02X} -> {bit}"
+                )
 
         return value
 
     # ==================================================================
-    # Active-SEN transactions
+    # SPI frames (SEN must already be low)
     # ==================================================================
 
-    def _raw_write_active(
-        self,
-        address,
-        value,
-        *,
-        bank=0,
-        page_access=0,
-        channel=0,
-    ):
-        """
-        Write one register while SEN is already low.
+    @staticmethod
+    def _make_header(read, m, p, channel, address):
+        """Build the 16-bit R/W, M, P, CH, A[11:0] header."""
 
-        Does not assert or deassert SEN.
-        """
+        for name, bit in (("read", read), ("m", m), ("p", p), ("channel", channel)):
+            if bit not in (0, 1):
+                raise ValueError(f"{name} must be 0 or 1, got {bit!r}")
 
-        if not 0 <= value <= 0xFF:
-            raise ValueError(
-                f"Value must be 8-bit, got 0x{value:X}"
-            )
-        header = self._make_header(
-            read=0,
-            bank=bank,
-            page_access=page_access,
-            channel=channel,
-            address=address,
-        )
+        if not 0 <= address <= 0xFFF:
+            raise ValueError(f"Address must be 12-bit, got 0x{address:X}")
 
-        word = (header << 8) | value
+        return (read << 15) | (m << 14) | (p << 13) | (channel << 12) | address
 
-        self._send_bits(word, 24)
+    def _write_frame(self, address, value, *, m=0, p=0, channel=0):
+        """One 24-clock register write."""
+
+        _check_byte(value)
+        header = self._make_header(0, m, p, channel, address)
 
         if self.verbose:
             print(
-                f"WRITE: "
-                f"R/W=0 "
-                f"M={bank} "
-                f"P={page_access} "
-                f"CH={channel} "
-                f"ADDR=0x{address:03X} "
-                f"DATA=0x{value:02X} "
-                f"WORD=0x{word:06X}"
+                f"  SPI WRITE M={m} P={p} CH={channel} "
+                f"ADDR=0x{address:03X} DATA=0x{value:02X}"
             )
 
-    def _raw_read_active(
-        self,
-        address,
-        *,
-        bank=0,
-        page_access=0,
-        channel=0,
-    ):
-        """
-        Read one register while SEN is already low.
+        self._send_bits((header << 8) | value, 24)
 
-        Does not assert or deassert SEN.
-        """
+    def _read_frame(self, address, *, m=0, p=0, channel=0):
+        """One 16-clock read header followed by 8 read clocks."""
 
-        header = self._make_header(
-            read=1,
-            bank=bank,
-            page_access=page_access,
-            channel=channel,
-            address=address,
-        )
-
-        if self.verbose:
-            print(
-                f"READ:  "
-                f"R/W=1 "
-                f"M={bank} "
-                f"P={page_access} "
-                f"CH={channel} "
-                f"ADDR=0x{address:03X} "
-                f"HEADER=0x{header:04X}"
-            )
+        header = self._make_header(1, m, p, channel, address)
 
         self._send_bits(header, 16)
-
         value = self._read_bits(8)
 
         if self.verbose:
             print(
-                f"       DATA=0x{value:02X}"
+                f"  SPI READ  M={m} P={p} CH={channel} "
+                f"ADDR=0x{address:03X} DATA=0x{value:02X}"
             )
 
         return value
 
-    # ==================================================================
-    # Page selection helpers
-    # ==================================================================
+    def _select_page(self, page):
+        """Write the page-select registers for page (SEN already low)."""
 
-    def _select_analog_page_active(self, selector):
-        """
-        Select an analog page while SEN is already low.
+        if page.analog_page is not None:
+            self._write_frame(self.REG_ANALOG_PAGE, page.analog_page)
 
-        selector:
+        if page.jesd_page is not None:
+            # Datasheet Table 9-3 order. 4-005h = 01h disables broadcast so
+            # the CH bit addresses channel A and B individually.
+            self._write_frame(self.REG_BROADCAST, 0x01, m=1)
+            self._write_frame(self.REG_JESD_PAGE_HI, page.jesd_page >> 8, m=1)
+            self._write_frame(self.REG_JESD_PAGE_LO, page.jesd_page & 0xFF, m=1)
+            self._write_frame(self.REG_JESD_PAGE1_HI, page.jesd_page1 >> 8, m=1)
+            self._write_frame(self.REG_JESD_PAGE1_LO, page.jesd_page1 & 0xFF, m=1)
 
-            0x80 -> Master
-            0x0F -> ADC
-        """
+    def _get_page(self, page_name, address):
+        """Look up a page by name and check that address belongs to it."""
 
-        self._raw_write_active(
-            0x011,
-            selector,
-            bank=0,
-            page_access=0,
-            channel=0,
-        )
-
-    def _select_jesd_page_active(self, selector):
-        """
-        Select a normal JESD page while SEN is already low.
-        """
-
-        low = selector & 0xFF
-        high = (selector >> 8) & 0xFF
-
-        # Select JESD page.
-        self._raw_write_active(
-            0x003,
-            low,
-            bank=1,
-            page_access=0,
-            channel=0,
-        )
-
-        # Enable independent channel control.
-        self._raw_write_active(
-            0x005,
-            0x01,
-            bank=1,
-            page_access=0,
-            channel=0,
-        )
-
-        # Select JESD page.
-        self._raw_write_active(
-            0x004,
-            high,
-            bank=1,
-            page_access=0,
-            channel=0,
-        )
-
-
-    def _select_offset_page_active(self, selector):
-        """
-        Select an offset page while SEN is already low.
-
-        First selects 0x6100 through 0x003/0x004.
-
-        Then:
-
-            0x0000 -> Offset Read
-            0x0500 -> Offset Load
-
-        through 0x001/0x002.
-        """
-
-        low = selector & 0xFF
-        high = (selector >> 8) & 0xFF
-
-        # Select 0x6100.
-
-        self._raw_write_active(
-            0x003,
-            0x00,
-            bank=1,
-            page_access=0,
-            channel=0,
-        )
-
-        self._raw_write_active(
-            0x004,
-            0x61,
-            bank=1,
-            page_access=0,
-            channel=0,
-        )
-
-        # Select offset subpage through 0x001/0x002.
-
-        self._raw_write_active(
-            0x001,
-            low,
-            bank=1,
-            page_access=0,
-            channel=0,
-        )
-
-        self._raw_write_active(
-            0x002,
-            high,
-            bank=1,
-            page_access=0,
-            channel=0,
-        )
-
-    def _select_page_active(self, page):
-        """
-        Select a user-visible page.
-
-        SEN must already be low.
-        """
-
-        if page not in self.PAGES:
+        try:
+            page = self.PAGES[page_name]
+        except KeyError:
             raise ValueError(
-                f"Unknown page '{page}'. "
+                f"Unknown page '{page_name}'. "
                 f"Available pages: {', '.join(self.PAGES)}"
+            ) from None
+
+        if address not in page.addresses:
+            raise ValueError(
+                f"Address 0x{address:03X} is outside page '{page_name}' "
+                f"(0x{page.addresses.start:03X}..0x{page.addresses.stop - 1:03X})"
             )
 
-        selector = self.PAGES[page]["selector"]
-
-        # Directly accessible register group.
-        if selector is None:
-            return
-
-        selector_type, selector_value = selector
-
-        if selector_type == "analog":
-            self._select_analog_page_active(
-                selector_value
-            )
-
-        elif selector_type == "jesd":
-            self._select_jesd_page_active(
-                selector_value
-            )
-
-        elif selector_type == "offset":
-            self._select_offset_page_active(
-                selector_value
-            )
-
-        else:
-            raise RuntimeError(
-                f"Unknown selector type '{selector_type}'"
-            )
+        return page
 
     # ==================================================================
-    # Page validation
+    # Public register interface
     # ==================================================================
 
-    def _validate_page(self, page, address):
-        """
-        Validate page name and register address.
-        """
+    def read_register(self, page, address, *, channel=0):
+        """Read one register. channel (0 = A, 1 = B) only matters for JESD pages."""
 
-        if page not in self.PAGES:
-            raise ValueError(
-                f"Unknown page '{page}'. "
-                f"Available pages:\n"
-                f"  " + "\n  ".join(self.PAGES)
-            )
-
-        spec = self.PAGES[page]
-
-        if not 0 <= address <= 0xFFF:
-            raise ValueError(
-                f"Address must be 12-bit, got 0x{address:X}"
-            )
-
-        if not (
-            spec["address_min"]
-            <= address
-            <= spec["address_max"]
-        ):
-            raise ValueError(
-                f"Address 0x{address:03X} is outside "
-                f"page '{page}' range "
-                f"0x{spec['address_min']:03X}"
-                f"..0x{spec['address_max']:03X}"
-            )
-
-        return spec
-
-    # ==================================================================
-    # Generic register access
-    # ==================================================================
-
-    def read_register(
-        self,
-        page,
-        address,
-        *,
-        channel=0,
-    ):
-        """
-        Read an arbitrary ADS54J40 register.
-        """
-
-        spec = self._validate_page(
-            page,
-            address,
-        )
-
-        if channel not in (0, 1):
-            raise ValueError(
-                "channel must be 0 or 1"
-            )
-
-        if self.verbose:
-            print(
-                f"READ REGISTER: "
-                f"{page} "
-                f"0x{address:03X}"
-            )
+        spec = self._get_page(page, address)
 
         self._begin()
-
         try:
-            self._select_page_active(page)
-
-            value = self._raw_read_active(
-                address,
-                bank=spec["bank"],
-                page_access=spec["page_access"],
-                channel=channel,
-            )
-
+            self._select_page(spec)
+            value = self._read_frame(address, m=spec.m, p=spec.p, channel=channel)
         finally:
             self._end()
-
-        if self.verbose:
-            print(
-                f"               "
-                f"{page} "
-                f"0x{address:03X} "
-                f"= 0x{value:02X}"
-            )
 
         return value
 
-    def write_register(
-        self,
-        page,
-        address,
-        value,
-        *,
-        channel=0,
-    ):
-        """
-        Write an arbitrary ADS54J40 register.
-        """
+    def write_register(self, page, address, value, *, channel=0):
+        """Write one register. channel (0 = A, 1 = B) only matters for JESD pages."""
 
-        spec = self._validate_page(
-            page,
-            address,
-        )
-
-        if not 0 <= value <= 0xFF:
-            raise ValueError(
-                f"Value must be 8-bit, got 0x{value:X}"
-            )
-
-        if channel not in (0, 1):
-            raise ValueError(
-                "channel must be 0 or 1"
-            )
-
-        if self.verbose:
-            print(
-                f"WRITE REGISTER: "
-                f"{page} "
-                f"0x{address:03X} "
-                f"= 0x{value:02X}"
-            )
+        spec = self._get_page(page, address)
+        _check_byte(value)
 
         self._begin()
-
         try:
-            self._select_page_active(page)
-
-            self._raw_write_active(
-                address,
-                value,
-                bank=spec["bank"],
-                page_access=spec["page_access"],
-                channel=channel,
-            )
-
+            self._select_page(spec)
+            self._write_frame(address, value, m=spec.m, p=spec.p, channel=channel)
         finally:
             self._end()
 
+    def read_many(self, registers):
+        """
+        Read several registers.
+
+        registers: iterable of (page, address) or (page, address, channel).
+        Returns a list of dicts with keys page, address, channel, value.
+        """
+
+        results = []
+        for entry in registers:
+            page, address, channel = (*entry, 0) if len(entry) == 2 else entry
+            value = self.read_register(page, address, channel=channel)
+            results.append(
+                {"page": page, "address": address, "channel": channel, "value": value}
+            )
+        return results
+
+    def write_many(self, registers, *, verify=False):
+        """
+        Write several registers.
+
+        registers: iterable of (page, address, value) or
+                   (page, address, value, channel).
+        With verify=True every register is read back and a RuntimeError
+        is raised on the first mismatch.
+        """
+
+        for entry in registers:
+            page, address, value, channel = (*entry, 0) if len(entry) == 3 else entry
+            self.write_register(page, address, value, channel=channel)
+
+            if verify:
+                readback = self.read_register(page, address, channel=channel)
+                if readback != value:
+                    raise RuntimeError(
+                        f"Readback mismatch: {page} 0x{address:03X} CH={channel}: "
+                        f"wrote 0x{value:02X}, read 0x{readback:02X}"
+                    )
+
     # ==================================================================
-    # Reset
+    # Reset / start-up
     # ==================================================================
 
     def reset(self):
         """
-        Perform an ADS54J40 software reset.
+        Software reset of the analog bank (0-000h = 81h, self-clearing).
 
-        Register 0x000 is the global software-reset register.
-
-        0x81 -> software reset.
+        This does not reset the JESD bank; use initialize() for that.
         """
-
-        if self.verbose:
-            print("RESET: ADS54J40 software reset")
-
-        self.raw_write(
-            address=0x000,
-            value=0x81,
-            bank=0,
-            page_access=0,
-            channel=0,
-        )
-
-    # ==================================================================
-    # Multiple-register access
-    # ==================================================================
-
-    def read_many(
-        self,
-        registers,
-        *,
-        verbose=None,
-    ):
-        """
-        Read multiple registers.
-
-        Input:
-
-            [
-                ("analog_master", 0x20),
-                ("analog_master", 0x21),
-                ("jesd_digital", 0x06),
-                ("jesd_analog", 0x16),
-            ]
-
-        Or:
-
-            [
-                ("jesd_digital", 0x06, 0),
-                ("jesd_digital", 0x06, 1),
-            ]
-        """
-
-        old_verbose = self.verbose
-
-        if verbose is not None:
-            self.verbose = verbose
-
-        results = []
-
-        try:
-            for entry in registers:
-
-                if len(entry) == 2:
-                    page, address = entry
-                    channel = 0
-
-                elif len(entry) == 3:
-                    page, address, channel = entry
-
-                else:
-                    raise ValueError(
-                        "Register entry must contain "
-                        "(page, address) or "
-                        "(page, address, channel)"
-                    )
-
-                value = self.read_register(
-                    page,
-                    address,
-                    channel=channel,
-                )
-
-                results.append({
-                    "page": page,
-                    "address": address,
-                    "channel": channel,
-                    "value": value,
-                })
-
-        finally:
-            self.verbose = old_verbose
-
-        return results
-
-    def write_many(
-        self,
-        registers,
-        *,
-        verify=False,
-        verbose=None,
-    ):
-        """
-        Write multiple registers.
-
-        Input:
-
-            [
-                ("analog_master", 0x20, 0x01),
-                ("jesd_digital", 0x06, 0x02),
-                ("jesd_analog", 0x16, 0x40),
-            ]
-
-        Or:
-
-            [
-                ("jesd_digital", 0x06, 0x02, 0),
-            ]
-
-        If verify=True, read each register back.
-        """
-
-        old_verbose = self.verbose
-
-        if verbose is not None:
-            self.verbose = verbose
-
-        results = []
-
-        try:
-            for entry in registers:
-
-                if len(entry) == 3:
-                    page, address, value = entry
-                    channel = 0
-
-                elif len(entry) == 4:
-                    page, address, value, channel = entry
-
-                else:
-                    raise ValueError(
-                        "Register entry must contain "
-                        "(page, address, value) or "
-                        "(page, address, value, channel)"
-                    )
-
-                self.write_register(
-                    page,
-                    address,
-                    value,
-                    channel=channel,
-                )
-
-                result = {
-                    "page": page,
-                    "address": address,
-                    "channel": channel,
-                    "written": value,
-                }
-
-                if verify:
-                    readback = self.read_register(
-                        page,
-                        address,
-                        channel=channel,
-                    )
-
-                    result["readback"] = readback
-                    result["verified"] = (
-                        readback == value
-                    )
-
-                    if readback != value:
-                        raise RuntimeError(
-                            f"Readback mismatch: "
-                            f"{page} "
-                            f"0x{address:03X} "
-                            f"CH={channel}: "
-                            f"wrote 0x{value:02X}, "
-                            f"read 0x{readback:02X}"
-                        )
-
-                results.append(result)
-
-        finally:
-            self.verbose = old_verbose
-
-        return results
-
-    # ==================================================================
-    # Convenience page-selection methods
-    # ==================================================================
-
-    def select_analog_page(self, page):
-        """
-        Explicitly select an analog page.
-
-        page:
-            "master"
-            "adc"
-
-        Normally use read_register() / write_register().
-        """
-
-        page_map = {
-            "master": "analog_master",
-            "adc": "analog_adc",
-        }
-
-        if page not in page_map:
-            raise ValueError(
-                "Analog page must be 'master' or 'adc'"
-            )
-
-        selector = self.PAGES[
-            page_map[page]
-        ]["selector"][1]
 
         self._begin()
-
         try:
-            self._select_analog_page_active(
-                selector
-            )
+            self._write_frame(self.REG_RESET, 0x81)
         finally:
             self._end()
-
-    def select_jesd_page(self, page):
-        """
-        Explicitly select a normal JESD page.
-
-        page:
-            "main"
-            "digital"
-            "analog"
-
-        Normally use read_register() / write_register().
-        """
-
-        page_map = {
-            "main": "jesd_main",
-            "digital": "jesd_digital",
-            "analog": "jesd_analog",
-        }
-
-        if page not in page_map:
-            raise ValueError(
-                "JESD page must be "
-                "'main', 'digital' or 'analog'"
-            )
-
-        selector = self.PAGES[
-            page_map[page]
-        ]["selector"][1]
-
-        self._begin()
-
-        try:
-            self._select_jesd_page_active(
-                selector
-            )
-        finally:
-            self._end()
-
-    def select_offset_page(self, page):
-        """
-        Explicitly select an offset page.
-
-        page:
-            "offset_read"
-            "offset_load"
-
-        Normally use read_register() / write_register().
-        """
-
-        if page not in (
-            "offset_read",
-            "offset_load",
-        ):
-            raise ValueError(
-                "Offset page must be "
-                "'offset_read' or 'offset_load'"
-            )
-
-        selector = self.PAGES[
-            page
-        ]["selector"][1]
-
-        self._begin()
-
-        try:
-            self._select_offset_page_active(
-                selector
-            )
-        finally:
-            self._end()
-
-    # ==================================================================
-    # Backwards-compatible convenience functions
-    # ==================================================================
-
-    def read_analog_register(
-        self,
-        address,
-        page="master",
-    ):
-        """
-        Compatibility wrapper.
-
-        Prefer:
-
-            read_register("analog_master", address)
-
-        or:
-
-            read_register("analog_adc", address)
-        """
-
-        page_map = {
-            "master": "analog_master",
-            "adc": "analog_adc",
-        }
-
-        if page not in page_map:
-            raise ValueError(
-                "Analog page must be 'master' or 'adc'"
-            )
-
-        return self.read_register(
-            page_map[page],
-            address,
-        )
-
-    def read_jesd_register(
-        self,
-        address,
-        page="main",
-        channel=0,
-    ):
-        """
-        Compatibility wrapper.
-
-        Prefer:
-
-            read_register("jesd_main", address)
-
-            read_register("jesd_digital", address)
-
-            read_register("jesd_analog", address)
-        """
-
-        page_map = {
-            "main": "jesd_main",
-            "digital": "jesd_digital",
-            "analog": "jesd_analog",
-        }
-
-        if page not in page_map:
-            raise ValueError(
-                "JESD page must be "
-                "'main', 'digital' or 'analog'"
-            )
-
-        return self.read_register(
-            page_map[page],
-            address,
-            channel=channel,
-        )
-    # #####################################################
-    # Startup sequence
-    ######################################################
 
     def initialize(self):
         """
-        Datasheet Table 9-1 startup sequence (LMFS = 8224).
-        Run once after power-up before accessing registers.
+        Reset sequence from datasheet Table 9-1, steps 2 and 3.
+
+        Afterwards the device is in its default state (LMFS = 8224, no
+        decimation). Any previous configuration is lost.
         """
+
         if self.verbose:
-            print("INIT: ADS54J40 startup sequence")
+            print("ADS54J40: initialization (datasheet Table 9-1)")
 
-        # 1. Software reset (general register 0x000, M=0, P=0)
-        self.raw_write(0x000, 0x81, bank=0, page_access=0, channel=0)
+        self.reset()
 
-        # 2. Clear unused JESD pages + select main digital page (4-001h..4-004h)
         self._begin()
-        self._raw_write_active(0x001, 0x00, bank=1, page_access=0, channel=0)
-        self._raw_write_active(0x002, 0x00, bank=1, page_access=0, channel=0)
-        self._raw_write_active(0x003, 0x00, bank=1, page_access=0, channel=0)
-        self._raw_write_active(0x004, 0x68, bank=1, page_access=0, channel=0)
-        self._end()
+        try:
+            # Re-enable broadcast (the power-on default) so the JESD bank
+            # resets below hit both channels. This driver disables
+            # broadcast on every JESD access, and the analog-bank reset
+            # above does not restore it.
+            self._write_frame(self.REG_BROADCAST, 0x00, m=1)
 
-        # 3. DIG RESET the JESD bank (channel A, 6-0F7h)
-        self.write_register("jesd_main", 0x0F7, 0x01, channel=0)
+            # Clear the unused page-select registers, select main digital.
+            self._write_frame(self.REG_JESD_PAGE1_LO, 0x00, m=1)
+            self._write_frame(self.REG_JESD_PAGE1_HI, 0x00, m=1)
+            self._write_frame(self.REG_JESD_PAGE_LO, 0x00, m=1)
+            self._write_frame(self.REG_JESD_PAGE_HI, 0x68, m=1)
 
-        # 4. Pulse reset for channel A (6-000h: 01 then 00)
-        self.write_register("jesd_main", 0x000, 0x01, channel=0)
-        self.write_register("jesd_main", 0x000, 0x00, channel=0)
+            # DIG RESET (self-clearing), then pulse PULSE RESET.
+            self._write_frame(0x0F7, 0x01, m=1, p=1)
+            self._write_frame(0x000, 0x01, m=1, p=1)
+            self._write_frame(0x000, 0x00, m=1, p=1)
 
-        # 5. Select master page, set ALWAYS WRITE 1 (0-059h)
-        self.write_register("analog_master", 0x059, 0x20)
+            # Master page: set the ALWAYS WRITE 1 bit in 0-059h.
+            self._write_frame(self.REG_ANALOG_PAGE, 0x80)
+            self._write_frame(0x059, 0x20)
+        finally:
+            self._end()
 
     # ==================================================================
     # Cleanup
     # ==================================================================
 
     def close(self):
-        """Close the FT245 GPIO interface."""
+        """Close the FTDI interface."""
+
         self.gpio.close()
 
     def __enter__(self):
-        self.initialize()
         return self
-    def __exit__(
-        self,
-        exc_type,
-        exc_value,
-        traceback,
-    ):
+
+    def __exit__(self, exc_type, exc_value, traceback):
         self.close()
 
 
+def _check_byte(value):
+    if not 0 <= value <= 0xFF:
+        raise ValueError(f"Value must be 8-bit, got 0x{value:X}")
