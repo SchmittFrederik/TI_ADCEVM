@@ -22,6 +22,7 @@ same SEN-low cycle before the actual access. Example:
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 from ti_adcevm.ftdi_gpio import (
     ADC_SDO,
@@ -41,8 +42,8 @@ class Page:
     m: int                 # M bit: 0 = analog bank, 1 = JESD bank
     p: int                 # P bit used for the register access itself
     addresses: range       # valid register addresses on this page
-    analog_page: int | None = None      # value for 0-011h (analog bank)
-    jesd_page: int | None = None        # value for 4-003h/4-004h
+    analog_page: Optional[int] = None   # value for 0-011h (analog bank)
+    jesd_page: Optional[int] = None     # value for 4-003h/4-004h
     jesd_page1: int = 0x0000            # value for 4-001h/4-002h
 
 
