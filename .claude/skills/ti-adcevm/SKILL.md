@@ -91,9 +91,10 @@ and `R0 = 0x00` (back to 3-wire). Run `lmk_checkconfig.py` to see it decoded.
 - LMK04828 RESET pin (D6) hardware reset only works in 3-wire mode (in 4-wire the LMK drives that pin).
 - **ADS54J40 page switching:** on hardware, the first SPI frame right after a JESD page select (sent in
   the same SEN cycle) landed in the *previous* page. That looked like "registers only read back after
-  leaving the page once". The driver now caches the selected page, selects pages in their own SEN
-  cycle, waits `PAGE_SETTLE` (1 ms) and does a throwaway read (`page_dummy_read=True`).
-  `scripts/ads_page_probe.py` reproduces it under three settings. Not documented in the datasheet.
+  leaving the page once". **Fix: page select in its own SEN cycle** (confirmed on hardware with
+  `ads_page_probe.py`: that alone makes all accesses correct). The driver also caches the selected
+  page, waits `PAGE_SETTLE` (1 ms) and does a throwaway read (`page_dummy_read=True`). Those two are
+  extra safety margin, not required. Not documented in the datasheet.
 - ADS54J40: opening the driver does **not** reset the chip; call `initialize()` explicitly (`ads_flash.py`
   does). Every JESD-bank access writes 4-005h = 01 (per-channel, broadcast off) plus the page selects.
   JESD link: **LMFS 4244** (L=4, M=2, F=4, S=4, N'=16), 8.0 Gbps/lane at 800 MSPS, FPGA core clock
